@@ -24,6 +24,10 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from core.models import (
+    ACTIVATION_OPTIONS, LAYER_TYPES_SCHEMA,
+    estimate_output_shape, validate_model_config,
+)
 from core.trainer import run_training
 from sessions.session_store import SessionStore
 
@@ -58,6 +62,80 @@ class StartTrainingRequest(BaseModel):
     """Body for POST /api/train/start."""
     session_id:     str
     training_config: dict  # ModelConfig JSON dict from CLAUDE.md
+
+
+class ValidateConfigRequest(BaseModel):
+    """Body for POST /api/train/validate-config."""
+    layers:         list   # list of layer config dicts
+    input_channels: int
+    input_samples:  int
+    classes:        list[str]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/train/layer-types
+# ---------------------------------------------------------------------------
+
+@router.get("/layer-types")
+async def get_layer_types() -> JSONResponse:
+    """
+    Return all supported layer types with their parameters, types, defaults,
+    and plain-English descriptions.
+
+    Used by the frontend 'Add Layer' dropdown and the parameter editor for
+    each layer card.
+    """
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={
+            "layer_types":        LAYER_TYPES_SCHEMA,
+            "activation_options": ACTIVATION_OPTIONS,
+        }),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/train/validate-config
+# ---------------------------------------------------------------------------
+
+@router.post("/validate-config")
+async def validate_config(request: ValidateConfigRequest) -> JSONResponse:
+    """
+    Validate a model architecture and compute the tensor shape after each layer.
+
+    Returns:
+      - valid: bool
+      - errors: list of human-readable error strings (empty if valid)
+      - layer_shapes: list of tensor shapes (one per layer, None if shape estimation failed)
+    """
+    config = {
+        "layers":         request.layers,
+        "input_channels": request.input_channels,
+        "input_samples":  request.input_samples,
+        "classes":        request.classes,
+    }
+
+    errors = validate_model_config(config)
+
+    # Only run shape estimation if there are no structural errors — a broken
+    # config would produce misleading or crashing shape estimates
+    if not errors:
+        try:
+            shapes = estimate_output_shape(config)
+        except Exception as exc:
+            logger.error("Shape estimation error: %s", exc)
+            shapes = [None] * len(request.layers)
+    else:
+        shapes = [None] * len(request.layers)
+
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={
+            "valid":        len(errors) == 0,
+            "errors":       errors,
+            "layer_shapes": shapes,
+        }),
+    )
 
 
 # ---------------------------------------------------------------------------

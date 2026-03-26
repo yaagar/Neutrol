@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 
-from core.models import EEGNet
+from core.models import EEGNet, build_model
 from sessions.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -190,7 +190,21 @@ def run_training(job_id: str, session_id: str, model_config: dict) -> None:
         # For small EEG datasets this is fine (training is fast on CPU).
         device = torch.device("cpu")
 
-        model = EEGNet(n_channels, n_samples, n_classes).to(device)
+        # Use the dynamic builder when a 'layers' config is provided.
+        # Fall back to the hardcoded EEGNet for configs without 'layers'
+        # (backward compatibility with old saved jobs).
+        if "layers" in model_config and model_config["layers"]:
+            model = build_model(model_config).to(device)
+            # Materialize lazy modules with a dummy forward pass before training
+            dummy = torch.zeros(1, 1, n_channels, n_samples).to(device)
+            with torch.no_grad():
+                model.eval()
+                model(dummy)
+            model.train()
+            logger.info("Job %s: using dynamic model (%d layers)", job_id, len(model_config["layers"]))
+        else:
+            model = EEGNet(n_channels, n_samples, n_classes).to(device)
+            logger.info("Job %s: using default EEGNet", job_id)
 
         # Adam is the standard choice for EEG models — handles sparse gradients
         # and adapts learning rate per-parameter.

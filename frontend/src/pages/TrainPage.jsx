@@ -14,6 +14,7 @@ import {
   Tooltip, Legend, ResponsiveContainer
 } from 'recharts'
 import { useSession } from '../hooks/useSession'
+import ModelLayerEditor from '../components/ModelLayerEditor'
 
 const API    = 'http://localhost:8000'
 const WS_API = 'ws://localhost:8000'
@@ -25,6 +26,19 @@ const DEFAULT_CONFIG = {
   batch_size:    32,
 }
 
+// Default EEGNet-inspired layer architecture from CLAUDE.md
+const DEFAULT_LAYERS = [
+  { type: 'Conv2d',          out_channels: 16, kernel_size: [1, 32], padding: 'same', activation: 'ELU', batch_norm: true },
+  { type: 'DepthwiseConv2d', depth_multiplier: 2, kernel_size: ['n_channels', 1], activation: 'ELU', batch_norm: true },
+  { type: 'AvgPool2d',       kernel_size: [1, 4] },
+  { type: 'Dropout',         rate: 0.5 },
+  { type: 'Conv2d',          out_channels: 32, kernel_size: [1, 16], padding: 'same', activation: 'ELU', batch_norm: true },
+  { type: 'AvgPool2d',       kernel_size: [1, 8] },
+  { type: 'Dropout',         rate: 0.5 },
+  { type: 'Flatten' },
+  { type: 'Linear',          out_features: 'n_classes' },
+]
+
 export default function TrainPage() {
   const { currentSession } = useSession()
 
@@ -33,7 +47,8 @@ export default function TrainPage() {
   const [labelsLoading, setLabelsLoading] = useState(false)
 
   // --- Model config form ---
-  const [config, setConfig] = useState(DEFAULT_CONFIG)
+  const [config, setConfig]   = useState(DEFAULT_CONFIG)
+  const [layers, setLayers]   = useState(DEFAULT_LAYERS)
 
   // --- Training state ---
   const [jobId, setJobId]           = useState(null)
@@ -145,11 +160,15 @@ export default function TrainPage() {
     // Auto-detect classes from labels
     const detectedClasses = Object.keys(labelSummary.counts).sort()
 
+    // input_samples = sample_rate × 1s window (default window size)
+    const inputSamples = currentSession.sample_rate * 1
+
     const modelConfig = {
       ...config,
       classes:        detectedClasses,
       input_channels: currentSession.n_channels,
-      input_samples:  256,  // 1s window at 256 Hz — matches default pipeline config
+      input_samples:  inputSamples,
+      layers,
     }
 
     try {
@@ -267,6 +286,23 @@ export default function TrainPage() {
             ) : (
               <span className="text-gray-600 text-xs">No labels detected</span>
             )}
+          </div>
+
+          {/* Layer architecture editor */}
+          <div className="mb-5">
+            <p className="text-xs text-gray-500 mb-3">
+              Layer Architecture
+              <span className="ml-2 text-gray-600">
+                — drag cards up/down to reorder, click × to delete
+              </span>
+            </p>
+            <ModelLayerEditor
+              layers={layers}
+              onChange={setLayers}
+              inputChannels={currentSession.n_channels}
+              inputSamples={currentSession.sample_rate * 1}
+              classes={detectedClasses}
+            />
           </div>
 
           <div className="grid grid-cols-3 gap-4">
