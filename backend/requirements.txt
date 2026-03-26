@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+mne
+numpy
+scipy
+torch
+scikit-learn
+python-multipart
+websockets

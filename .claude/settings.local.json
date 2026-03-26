@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm create:*)",
+      "Bash(npm install:*)",
+      "Bash(pip show:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(./venv/Scripts/pip install:*)",
+      "Bash(npm run:*)",
+      "Bash(python -:*)",
+      "Bash(\"C:/Users/yasha/OneDrive/Documents/Programming/Python/Neutrol/venv/Scripts/python.exe\" -c \":*)"
+    ]
+  }
+}

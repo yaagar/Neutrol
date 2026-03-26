@@ -1,0 +1,20 @@
+/* Tailwind's three directive layers:
+   - base: resets (normalize.css equivalent)
+   - components: reusable class combos
+   - utilities: the actual utility classes like p-4, flex, text-gray-800
+   Without these three lines, Tailwind outputs nothing. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global reset — ensure the app fills the full viewport */
+body {
+  margin: 0;
+  padding: 0;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
