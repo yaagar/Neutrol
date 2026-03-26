@@ -414,11 +414,13 @@ def parse_event_file(
             format = "mne_eve"
         elif ext == ".vmrk":
             format = "vmrk"
+        elif ext == ".event":
+            format = "edf_event"
         else:
             raise ValueError(
                 f"Cannot detect event file format from extension '{ext}'. "
-                "Supported: .tsv (BIDS), .eve (MNE), .vmrk (BrainVision). "
-                "Pass format='bids_tsv'|'mne_eve'|'vmrk' to specify manually."
+                "Supported: .tsv (BIDS), .eve (MNE), .vmrk (BrainVision), .event (EDF). "
+                "Pass format='bids_tsv'|'mne_eve'|'vmrk'|'edf_event' to specify manually."
             )
 
     if format == "bids_tsv":
@@ -427,11 +429,77 @@ def parse_event_file(
         return _parse_mne_eve(file_path, sample_rate)
     elif format == "vmrk":
         return _parse_vmrk(file_path, sample_rate)
+    elif format == "edf_event":
+        return _parse_edf_event(file_path)
     else:
         raise ValueError(
             f"Unknown event file format '{format}'. "
-            "Supported: 'bids_tsv', 'mne_eve', 'vmrk'."
+            "Supported: 'bids_tsv', 'mne_eve', 'vmrk', 'edf_event'."
         )
+
+
+def _parse_edf_event(file_path: str) -> list[EventMarker]:
+    """
+    Parse an MNE-style .edf.event binary file.
+
+    This format is produced when MNE exports the annotations from an EDF+ file.
+    It is a mixed binary/text format: binary timestamp bytes are interspersed with
+    plain ASCII text records in the form "<label> duration: <seconds>".
+
+    Because decoding the binary timestamp bytes is non-trivial (they appear to be
+    a custom internal MNE format), we extract labels and durations from the text
+    content and compute onset times cumulatively. This is valid for datasets like
+    PhysioNet where annotations are back-to-back with no gaps.
+
+    Format found in the file (example):
+      ... binary bytes ... T0 duration: 4.2 ... T1 duration: 4.1 ...
+
+    Returns:
+        List of EventMarker objects with cumulative onset times, sorted by onset.
+    """
+    import re
+
+    with open(file_path, "rb") as f:
+        raw_bytes = f.read()
+
+    # Extract all label+duration pairs from the binary blob using regex.
+    # The text is ASCII-encoded inside the binary file.
+    # Pattern matches things like: "T0 duration: 4.2" or "T1 duration: 4.10"
+    events_raw = re.findall(rb'([A-Za-z][A-Za-z0-9_]*)\s+duration:\s+([0-9]+(?:\.[0-9]+)?)', raw_bytes)
+
+    if not events_raw:
+        # Try a looser pattern — some files might omit the "duration:" keyword
+        # and just list the label followed by a float
+        events_raw = re.findall(rb'([A-Za-z][A-Za-z0-9_/]*)\s+([0-9]+\.[0-9]+)', raw_bytes)
+
+    if not events_raw:
+        logger.warning("No events found in .edf.event file: %s", file_path)
+        return []
+
+    # Compute cumulative onset times: events are assumed to be sequential
+    # (each starts immediately after the previous one ends).
+    # This holds for PhysioNet and most BCI paradigms where rest and task
+    # periods fill the entire recording.
+    markers: list[EventMarker] = []
+    onset = 0.0
+
+    for label_bytes, duration_bytes in events_raw:
+        label       = label_bytes.decode("ascii", errors="replace").strip()
+        duration_sec = float(duration_bytes.decode("ascii"))
+
+        markers.append(EventMarker(
+            onset_sec=   round(onset, 4),
+            duration_sec=duration_sec,
+            label=       label,
+            description= f"{label} duration: {duration_sec}",
+        ))
+        onset += duration_sec
+
+    logger.info(
+        "Parsed %d events from .edf.event file: %s (total %.2fs)",
+        len(markers), file_path, onset,
+    )
+    return markers
 
 
 def _parse_bids_tsv(file_path: str) -> list[EventMarker]:
@@ -573,15 +641,18 @@ def apply_events_to_windows(
         start_sec = (i * step_samples) / sample_rate
         end_sec   = start_sec + window_sec
 
-        # Find the first event whose onset falls within this window's time range.
-        # Events are sorted by onset_sec, so we can stop early.
+        # Find the event that is ACTIVE during this window's start time.
+        # An event is active if the window starts within the event's time span:
+        #   event.onset_sec <= window_start < event.onset_sec + event.duration_sec
+        # This correctly labels all windows within a 4-second event, not just the first.
         matched_label = "unknown"
         for event in events:
-            if start_sec <= event.onset_sec < end_sec:
+            if event.onset_sec > start_sec:
+                break  # events are sorted — all remaining start later than this window
+            event_end = event.onset_sec + event.duration_sec
+            if event.onset_sec <= start_sec < event_end:
                 matched_label = event.label
-                break
-            if event.onset_sec >= end_sec:
-                break  # events are sorted — no point searching further
+                # Don't break — a later event might also cover this window (take last match)
 
         labeled.append(LabeledWindow(
             window_id=     str(uuid.uuid4()),

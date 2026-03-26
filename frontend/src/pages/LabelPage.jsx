@@ -61,6 +61,14 @@ export default function LabelPage() {
   const [saving, setSaving]           = useState(false)
   const [saveResult, setSaveResult]   = useState(null)   // {success, message}
 
+  // --- Event file auto-labeling state ---
+  const [eventFile, setEventFile]             = useState(null)       // File object from input
+  const [eventUploading, setEventUploading]   = useState(false)
+  const [eventApplying, setEventApplying]     = useState(false)
+  const [eventUploadResult, setEventUploadResult] = useState(null)   // parsed marker summary
+  const [eventApplyResult, setEventApplyResult]   = useState(null)   // label counts after apply
+  const [eventError, setEventError]           = useState(null)
+
   // --- Fetch runs when session changes ---
   useEffect(() => {
     if (!currentSession) return
@@ -170,6 +178,65 @@ export default function LabelPage() {
       }
     } catch {
       // No existing labels — start fresh
+    }
+  }
+
+  async function uploadEventFile() {
+    if (!eventFile || !currentSession) return
+    setEventUploading(true)
+    setEventError(null)
+    setEventUploadResult(null)
+    setEventApplyResult(null)
+
+    const form = new FormData()
+    form.append('file', eventFile)
+    form.append('session_id', currentSession.session_id)
+
+    try {
+      const res = await fetch(`${API}/api/data/upload-events`, { method: 'POST', body: form })
+      const json = await res.json()
+      if (json.success) {
+        setEventUploadResult(json.data)
+      } else {
+        setEventError(json.error || 'Upload failed.')
+      }
+    } catch {
+      setEventError('Could not reach the backend.')
+    } finally {
+      setEventUploading(false)
+    }
+  }
+
+  async function applyEventLabels() {
+    if (!activeRun || !currentSession || !eventUploadResult) return
+    setEventApplying(true)
+    setEventError(null)
+
+    // Derive window_sec from the run's window shape and session sample rate
+    const windowSec = activeRun.window_shape[1] / currentSession.sample_rate
+
+    try {
+      const res = await fetch(`${API}/api/labels/from-events`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: currentSession.session_id,
+          run_id: activeRun.run_id,
+          window_sec: windowSec,
+        }),
+      })
+      const json = await res.json()
+      if (json.success) {
+        setEventApplyResult(json.data)
+        // Load the resulting labels into the manual label map so the UI reflects them
+        await loadExistingLabels()
+      } else {
+        setEventError(json.error || 'Apply failed.')
+      }
+    } catch {
+      setEventError('Could not reach the backend.')
+    } finally {
+      setEventApplying(false)
     }
   }
 
@@ -448,6 +515,90 @@ export default function LabelPage() {
         ) : (
           <div className="flex items-center justify-center h-48 text-gray-600 text-sm">
             No data loaded.
+          </div>
+        )}
+      </div>
+
+      {/* ---------------------------------------------------------------- */}
+      {/* Auto-label from event file                                        */}
+      {/* ---------------------------------------------------------------- */}
+      <div className="bg-gray-900 border border-gray-700 rounded-xl p-4 mb-6">
+        <h2 className="text-sm font-semibold text-gray-200 mb-1">Auto-label from Event File</h2>
+        <p className="text-xs text-gray-500 mb-3">
+          Upload a <span className="font-mono">.edf.event</span>, <span className="font-mono">.tsv</span>, <span className="font-mono">.eve</span>, or{' '}
+          <span className="font-mono">.vmrk</span> file to automatically label all windows.
+        </p>
+
+        {/* File picker + upload button */}
+        <div className="flex gap-2 items-center mb-3">
+          <label className="flex-1 cursor-pointer bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-400 hover:border-gray-500 transition-colors truncate">
+            {eventFile ? eventFile.name : 'Choose event file…'}
+            <input
+              type="file"
+              accept=".event,.tsv,.eve,.vmrk"
+              className="hidden"
+              onChange={e => {
+                setEventFile(e.target.files[0] || null)
+                setEventUploadResult(null)
+                setEventApplyResult(null)
+                setEventError(null)
+              }}
+            />
+          </label>
+          <button
+            onClick={uploadEventFile}
+            disabled={!eventFile || eventUploading}
+            className="text-sm px-4 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-gray-200 rounded transition-colors whitespace-nowrap"
+          >
+            {eventUploading ? 'Uploading…' : 'Parse File'}
+          </button>
+        </div>
+
+        {/* Error */}
+        {eventError && (
+          <p className="text-red-400 text-xs mb-2">{eventError}</p>
+        )}
+
+        {/* Upload result — show parsed event summary */}
+        {eventUploadResult && !eventApplyResult && (
+          <div className="bg-gray-800 rounded-lg p-3 mb-3">
+            <p className="text-xs text-gray-400 mb-1">
+              Parsed <span className="text-gray-200 font-medium">{eventUploadResult.n_markers}</span> events:
+            </p>
+            <div className="flex flex-wrap gap-2 mb-3">
+              {Object.entries(eventUploadResult.label_counts).map(([label, count]) => (
+                <span key={label} className="text-xs bg-gray-700 text-gray-300 px-2 py-0.5 rounded-full">
+                  {count}× {label}
+                </span>
+              ))}
+            </div>
+            <button
+              onClick={applyEventLabels}
+              disabled={eventApplying}
+              className="text-sm px-4 py-1.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white rounded transition-colors"
+            >
+              {eventApplying ? 'Applying…' : 'Apply Labels to All Windows'}
+            </button>
+          </div>
+        )}
+
+        {/* Apply result — show final label counts */}
+        {eventApplyResult && (
+          <div className="bg-gray-800 rounded-lg p-3">
+            <p className="text-xs text-green-400 mb-1 font-medium">
+              Labels applied to {eventApplyResult.total_labeled} windows
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {Object.entries(eventApplyResult.label_counts).map(([label, count]) => (
+                <span key={label} className={`text-xs px-2 py-0.5 rounded-full ${
+                  label === 'unknown'
+                    ? 'bg-gray-700 text-gray-500'
+                    : 'bg-purple-900 text-purple-200'
+                }`}>
+                  {count}× {label}
+                </span>
+              ))}
+            </div>
           </div>
         )}
       </div>

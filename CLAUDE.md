@@ -719,9 +719,9 @@ Always start every new session with: **"Read CLAUDE.md before doing anything."**
 | 1 | ✅ Done | Scaffold + data import backend + preprocessing backend |
 | 2 | ✅ Done | Import page UI + session manager + waveform display |
 | 3 | ✅ Done | Labeling page UI + label save/load API |
-| 4 | 🔄 Test first | CNN model + training endpoint + training progress WebSocket |
-| **4B** | **Next** | Test + fix Session 4 → signal analysis backend (FFT/PSD/bands/spectrogram) → event file parsing → new preprocessing steps (reref, epoch rejection, channel selector, ICA) → analysis tabs on PreprocessPage |
-| 5 | Upcoming | Dynamic CNN layer editor UI + model validation endpoint + layer shape display |
+| 4 | ✅ Done | CNN model + training endpoint + training progress WebSocket |
+| 4B | ✅ Done | Signal analysis backend (FFT/PSD/bands/spectrogram) + event file parsing (.edf.event/.tsv/.eve/.vmrk) + new preprocessing steps (reref, epoch rejection, channel selector, ICA) + analysis tabs on PreprocessPage + event file upload UI on LabelPage |
+| **5** | **Next** | Dynamic CNN layer editor UI + model validation endpoint + layer shape display |
 | 6 | Upcoming | Training results page (loss curves, accuracy, confusion matrix) |
 | 7 | Upcoming | Inference engine + real-time WebSocket + inference page UI |
 | 8 | Upcoming | Export system (pipeline JSON, model weights, Python inference script) |
