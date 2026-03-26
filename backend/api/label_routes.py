@@ -22,7 +22,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from core.data_loader import LabeledWindow
+from core.data_loader import LabeledWindow, apply_events_to_windows
 from sessions.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -69,6 +69,13 @@ class SaveLabelsRequest(BaseModel):
     session_id: str
     run_id:     str
     labels:     list[WindowLabel]
+
+
+class FromEventsRequest(BaseModel):
+    """Body for POST /api/labels/from-events."""
+    session_id:  str
+    run_id:      str
+    window_sec:  float = 1.0    # window duration — needed to compute time ranges
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +186,92 @@ async def get_labels(session_id: str) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # DELETE /api/labels/{session_id}
 # ---------------------------------------------------------------------------
+
+@router.post("/from-events")
+async def labels_from_events(request: FromEventsRequest) -> JSONResponse:
+    """
+    Automatically label windows using stored EventMarkers for the session.
+
+    Workflow:
+      1. User uploads an event file (POST /api/data/upload-events)
+      2. User runs the pipeline (POST /api/pipeline/run)
+      3. User calls this endpoint — windows are matched to events automatically
+      4. Labeled windows are stored in store.labeled_data[session_id]
+
+    Windows with no matching event get label 'unknown'.
+    The user should filter these before training.
+    """
+    # Validate session
+    session = store.sessions.get(request.session_id)
+    if session is None:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error=f"Session '{request.session_id}' not found."),
+        )
+
+    # Validate pipeline run exists
+    run = store.pipeline_runs.get(request.run_id)
+    if run is None or not isinstance(run, dict):
+        return JSONResponse(
+            status_code=404,
+            content=api_response(
+                False,
+                error=f"Pipeline run '{request.run_id}' not found. Run the pipeline first.",
+            ),
+        )
+
+    # Validate event markers exist for this session
+    markers = store.event_markers.get(request.session_id, [])
+    if not markers:
+        return JSONResponse(
+            status_code=400,
+            content=api_response(
+                False,
+                error=(
+                    f"No event markers found for session '{request.session_id}'. "
+                    "Upload an event file first via POST /api/data/upload-events."
+                ),
+            ),
+        )
+
+    windows = run["windows"]
+    if not windows:
+        return JSONResponse(
+            status_code=400,
+            content=api_response(False, error="Pipeline run has no windows."),
+        )
+
+    # Match events to windows and build LabeledWindows
+    labeled_windows = apply_events_to_windows(
+        windows=windows,
+        events=markers,
+        sample_rate=session.sample_rate,
+        window_sec=request.window_sec,
+        session_id=request.session_id,
+    )
+
+    # Store — overwrites any previous labels for this session
+    store.labeled_data[request.session_id] = labeled_windows
+
+    # Build label count summary for the response
+    label_counts: dict[str, int] = {}
+    for lw in labeled_windows:
+        label_counts[lw.label] = label_counts.get(lw.label, 0) + 1
+
+    logger.info(
+        "Auto-labeled %d windows from events for session %s: %s",
+        len(labeled_windows), request.session_id, label_counts,
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={
+            "session_id":    request.session_id,
+            "total_labeled": len(labeled_windows),
+            "label_counts":  label_counts,
+        }),
+    )
+
 
 @router.delete("/{session_id}")
 async def delete_labels(session_id: str) -> JSONResponse:

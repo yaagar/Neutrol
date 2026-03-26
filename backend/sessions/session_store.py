@@ -28,13 +28,12 @@ class SessionStore:
             cls._instance = super().__new__(cls)
 
             # Initialize all storage dicts exactly once.
-            # These are the four data stores the entire backend uses:
 
             # Maps session_id (str) → DataSession object
             # Populated by data_routes.py on file upload.
             cls._instance.sessions: dict = {}
 
-            # Maps run_id (str) → list[np.ndarray] (preprocessed windows)
+            # Maps run_id (str) → dict with windows and metadata
             # Populated by pipeline_routes.py after running a pipeline.
             cls._instance.pipeline_runs: dict = {}
 
@@ -46,5 +45,10 @@ class SessionStore:
             # (epoch, loss, accuracy, status, model path when done)
             # Populated by train_routes.py when training starts.
             cls._instance.training_jobs: dict = {}
+
+            # Maps session_id (str) → list[EventMarker]
+            # Populated by data_routes.py when an event file is uploaded.
+            # Used by label_routes.py to auto-label windows from events.
+            cls._instance.event_markers: dict = {}
 
         return cls._instance

@@ -17,7 +17,15 @@ import shutil
 from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-from core.data_loader import get_session_summary, load_csv, load_edf
+from fastapi import Form
+from core.data_loader import (
+    EventMarker,
+    get_session_summary,
+    load_csv,
+    load_edf,
+    load_edf_with_events,
+    parse_event_file,
+)
 from sessions.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -264,4 +272,96 @@ async def delete_session(session_id: str) -> JSONResponse:
     return JSONResponse(
         status_code=200,
         content=api_response(True, data={"deleted_session_id": session_id}),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/data/upload-events
+# ---------------------------------------------------------------------------
+
+@router.post("/upload-events")
+async def upload_events(
+    file: UploadFile,
+    session_id: str = Form(...),
+) -> JSONResponse:
+    """
+    Accept a standalone event/annotation file, parse it into EventMarkers,
+    and store them for the given session.
+
+    Supported formats: .tsv (BIDS), .eve (MNE), .vmrk (BrainVision).
+    The format is auto-detected from the file extension.
+
+    After uploading events, call POST /api/labels/from-events to automatically
+    label the windowed data from a pipeline run using these markers.
+    """
+    # Validate session exists before parsing the file
+    session = store.sessions.get(session_id)
+    if session is None:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(
+                False,
+                error=f"Session '{session_id}' not found. Upload the EEG file first.",
+            ),
+        )
+
+    # Save the event file to temp/ with a unique prefix to avoid collisions
+    import uuid as _uuid
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    filename = file.filename or "events"
+    unique_name = f"{_uuid.uuid4().hex[:8]}_{filename}"
+    temp_path = os.path.join(TEMP_DIR, unique_name)
+
+    try:
+        with open(temp_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content=api_response(False, error=f"Could not save event file: {exc}"),
+        )
+
+    # Parse the event file using the session's sample rate for unit conversion
+    try:
+        markers = parse_event_file(temp_path, sample_rate=session.sample_rate)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content=api_response(False, error=str(exc)),
+        )
+    except Exception as exc:
+        logger.error("Error parsing event file %s: %s", filename, exc)
+        return JSONResponse(
+            status_code=500,
+            content=api_response(False, error=f"Failed to parse event file: {exc}"),
+        )
+
+    # Store in singleton — accessible by label_routes.py for from-events endpoint
+    store.event_markers[session_id] = markers
+
+    logger.info(
+        "Uploaded %d event markers for session %s (file: %s)",
+        len(markers), session_id, filename,
+    )
+
+    # Return summary of parsed markers
+    label_counts: dict[str, int] = {}
+    for m in markers:
+        label_counts[m.label] = label_counts.get(m.label, 0) + 1
+
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={
+            "session_id":   session_id,
+            "n_markers":    len(markers),
+            "label_counts": label_counts,
+            "markers": [
+                {
+                    "onset_sec":    m.onset_sec,
+                    "duration_sec": m.duration_sec,
+                    "label":        m.label,
+                }
+                for m in markers[:20]   # first 20 for preview (don't send all)
+            ],
+        }),
     )

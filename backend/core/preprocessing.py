@@ -8,10 +8,14 @@ Design principles (from CLAUDE.md):
     exactly reproduces any previous result.
   - SlidingWindow is always the last step — it changes the return type from
     np.ndarray to list[np.ndarray].
+  - EpochRejection is applied AFTER SlidingWindow — it filters out bad windows.
 
 Calling convention for all steps:
   Input signals shape:  (n_channels, n_samples)
-  Output signals shape: (n_channels, n_samples)   [except SlidingWindow]
+  Output signals shape: (n_channels, n_samples)   [except SlidingWindow, EpochRejection]
+
+The optional channel_names parameter on apply() is used by ChannelSelector
+to map channel names to array indices. Other steps ignore it.
 """
 
 from __future__ import annotations
@@ -42,13 +46,20 @@ class PreprocessingStep:
       from_dict() — reconstruct from that same dict
     """
 
-    def apply(self, signals: np.ndarray, sample_rate: int) -> np.ndarray:
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
         """
         Apply this step to the signals.
 
         Args:
-            signals:     Input array of shape (n_channels, n_samples).
-            sample_rate: Sampling frequency in Hz — needed by filter design functions.
+            signals:       Input array of shape (n_channels, n_samples).
+            sample_rate:   Sampling frequency in Hz — needed by filter design functions.
+            channel_names: Optional list of channel names, one per row of signals.
+                           Used by ChannelSelector; ignored by all other steps.
 
         Returns:
             Transformed array, same shape (n_channels, n_samples).
@@ -107,7 +118,12 @@ class BandpassFilter(PreprocessingStep):
         self.low_hz = low_hz
         self.high_hz = high_hz
 
-    def apply(self, signals: np.ndarray, sample_rate: int) -> np.ndarray:
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
         """Apply the bandpass filter to every channel independently."""
         # Design the filter in second-order sections (sos) format.
         # We pass the cutoff frequencies as a fraction of the Nyquist frequency
@@ -172,7 +188,12 @@ class NotchFilter(PreprocessingStep):
         self.freq_hz = freq_hz
         self.quality_factor = quality_factor
 
-    def apply(self, signals: np.ndarray, sample_rate: int) -> np.ndarray:
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
         """Apply the notch filter to every channel independently."""
         # iirnotch returns (b, a) coefficient arrays — the traditional IIR format.
         # We convert to sosfiltfilt-compatible format via sosfilt for stability,
@@ -244,7 +265,12 @@ class Normalize(PreprocessingStep):
             )
         self.method = method
 
-    def apply(self, signals: np.ndarray, sample_rate: int) -> np.ndarray:
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
         """Normalize each channel independently."""
         normalized = np.zeros_like(signals, dtype=np.float32)
 
@@ -320,7 +346,12 @@ class SlidingWindow(PreprocessingStep):
         self.window_sec = window_sec
         self.overlap_ratio = overlap_ratio
 
-    def apply(self, signals: np.ndarray, sample_rate: int) -> list[np.ndarray]:  # type: ignore[override]
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> list[np.ndarray]:  # type: ignore[override]
         """
         Cut signals into overlapping windows.
 
@@ -374,6 +405,360 @@ class SlidingWindow(PreprocessingStep):
 
 
 # ---------------------------------------------------------------------------
+# Rereferencing — change the voltage reference electrode
+# ---------------------------------------------------------------------------
+
+class Rereferencing(PreprocessingStep):
+    """
+    Re-reference EEG signals to a new voltage reference.
+
+    Raw EEG is measured relative to a single physical reference electrode.
+    This introduces bias — that electrode's own brain activity contaminates
+    every channel. Re-referencing mathematically moves the reference point.
+
+    Supported methods:
+      'average': Subtract the mean of all channels from each channel.
+                 This is the most common method in BCI research — it distributes
+                 the reference signal equally and removes any single-electrode bias.
+      'linked_mastoid': Subtract the mean of channels M1 and M2 (mastoid electrodes).
+                        Used in clinical EEG. Requires channel_names to find M1/M2.
+    """
+
+    VALID_METHODS = ("average", "linked_mastoid")
+
+    def __init__(self, method: str = "average") -> None:
+        """
+        Args:
+            method: 'average' (common average reference) or 'linked_mastoid'.
+        """
+        if method not in self.VALID_METHODS:
+            raise ValueError(
+                f"Unknown rereferencing method '{method}'. "
+                f"Supported: {self.VALID_METHODS}"
+            )
+        self.method = method
+
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
+        """Apply re-referencing to all channels."""
+        if self.method == "average":
+            # Subtract the mean across all channels at each time point.
+            # signals.mean(axis=0) has shape (n_samples,) — broadcasting works:
+            # (n_channels, n_samples) - (n_samples,) = (n_channels, n_samples)
+            return signals - signals.mean(axis=0)
+
+        elif self.method == "linked_mastoid":
+            if channel_names is None:
+                raise ValueError(
+                    "linked_mastoid rereferencing requires channel_names to find M1 and M2."
+                )
+            # Find M1 and M2 indices (case-insensitive search)
+            names_lower = [n.lower() for n in channel_names]
+            mastoid_indices = [
+                i for i, n in enumerate(names_lower)
+                if n in ("m1", "m2", "a1", "a2")  # A1/A2 are also common mastoid labels
+            ]
+            if not mastoid_indices:
+                raise ValueError(
+                    f"linked_mastoid rereferencing: could not find M1/M2 or A1/A2 channels. "
+                    f"Available channels: {channel_names}"
+                )
+            # Reference = mean of the mastoid channels at each time point
+            reference = signals[mastoid_indices].mean(axis=0)
+            return signals - reference
+
+        # Should never reach here after __init__ validation
+        return signals
+
+    def to_dict(self) -> dict:
+        return {"step": "reref", "method": self.method}
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "Rereferencing":
+        return cls(method=config.get("method", "average"))
+
+
+# ---------------------------------------------------------------------------
+# ChannelSelector — keep only a specified subset of channels
+# ---------------------------------------------------------------------------
+
+class ChannelSelector(PreprocessingStep):
+    """
+    Keep only the specified EEG channels and discard the rest.
+
+    Many EEG devices record 32–256 channels. For motor imagery tasks, you only
+    need ~8–16 channels over the motor cortex (C3, Cz, C4 and neighbors).
+    Fewer channels = faster training, less noise, smaller model.
+
+    This step MUST be applied BEFORE windowing.
+
+    The channel_names parameter in apply() is required — it maps the requested
+    channel names to their indices in the signals array.
+    """
+
+    def __init__(self, channels: list[str]) -> None:
+        """
+        Args:
+            channels: Ordered list of channel names to keep.
+                      Example: ["C3", "Cz", "C4", "Fp1", "Fp2"]
+        """
+        if not channels:
+            raise ValueError("ChannelSelector requires at least one channel name.")
+        self.channels = channels
+
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
+        """
+        Select and return only the specified channels.
+
+        Raises ValueError if any requested channel is not in channel_names.
+        """
+        if channel_names is None:
+            raise ValueError(
+                "ChannelSelector.apply() requires channel_names to be provided. "
+                "The Pipeline.run() method should pass session.channel_names."
+            )
+
+        # Build a set for fast membership checking
+        available = {name: i for i, name in enumerate(channel_names)}
+
+        missing = [ch for ch in self.channels if ch not in available]
+        if missing:
+            raise ValueError(
+                f"ChannelSelector: the following channels were not found in the session: "
+                f"{missing}. Available channels: {list(available.keys())}"
+            )
+
+        # Extract the rows corresponding to the requested channels, in order
+        indices = [available[ch] for ch in self.channels]
+        return signals[indices, :]
+
+    def to_dict(self) -> dict:
+        return {"step": "channels", "channels": self.channels}
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "ChannelSelector":
+        return cls(channels=config.get("channels", []))
+
+
+# ---------------------------------------------------------------------------
+# EpochRejection — remove artifact-contaminated windows after windowing
+# ---------------------------------------------------------------------------
+
+class EpochRejection(PreprocessingStep):
+    """
+    Reject windowed EEG epochs (windows) that contain artifacts.
+
+    Must be applied AFTER SlidingWindow. It operates on the list of windows,
+    not on the continuous signal. Use Pipeline — it handles the ordering.
+
+    Rule: a window is rejected if ANY sample in ANY channel exceeds ±threshold_uv.
+    Spikes of ±100µV or more are almost always artifacts (blink, jaw clench,
+    electrode pop), not brain signal. Training on them confuses the model.
+
+    The apply() method is intentionally left as a placeholder — use apply_to_windows().
+    """
+
+    DEFAULT_THRESHOLD = 100.0   # microvolts (µV)
+
+    def __init__(self, threshold_uv: float = DEFAULT_THRESHOLD) -> None:
+        """
+        Args:
+            threshold_uv: Amplitude threshold in microvolts. Any window where
+                          any channel exceeds ±threshold_uv is rejected.
+                          Default 100.0 µV is standard for BCI research.
+        """
+        if threshold_uv <= 0:
+            raise ValueError(f"threshold_uv must be positive, got {threshold_uv}")
+        self.threshold_uv = threshold_uv
+
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
+        """Not used directly — call apply_to_windows() for epoch rejection."""
+        raise NotImplementedError(
+            "EpochRejection must be applied AFTER SlidingWindow. "
+            "The Pipeline automatically calls apply_to_windows() for this step."
+        )
+
+    def apply_to_windows(
+        self,
+        windows: list[np.ndarray],
+        sample_rate: int,
+    ) -> list[np.ndarray]:
+        """
+        Filter out windows that exceed the amplitude threshold.
+
+        Args:
+            windows: List of np.ndarray, each shape (n_channels, n_samples).
+            sample_rate: Not used here (kept for consistent interface).
+
+        Returns:
+            Filtered list with artifact windows removed.
+        """
+        kept: list[np.ndarray] = []
+        rejected_count = 0
+
+        for window in windows:
+            # Check if any sample in any channel exceeds the threshold
+            max_amplitude = np.abs(window).max()
+            if max_amplitude <= self.threshold_uv:
+                kept.append(window)
+            else:
+                rejected_count += 1
+                logger.debug(
+                    "Rejected window: max amplitude %.1f µV exceeds threshold %.1f µV",
+                    max_amplitude, self.threshold_uv,
+                )
+
+        logger.info(
+            "EpochRejection: kept %d/%d windows (rejected %d with >.±%.1f µV)",
+            len(kept), len(windows), rejected_count, self.threshold_uv,
+        )
+        return kept
+
+    def to_dict(self) -> dict:
+        return {"step": "reject", "threshold_uv": self.threshold_uv}
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "EpochRejection":
+        return cls(threshold_uv=config.get("threshold_uv", cls.DEFAULT_THRESHOLD))
+
+
+# ---------------------------------------------------------------------------
+# ICAFilter — Independent Component Analysis artifact removal
+# ---------------------------------------------------------------------------
+
+class ICAFilter(PreprocessingStep):
+    """
+    Remove artifacts using Independent Component Analysis (ICA).
+
+    ICA mathematically separates the mixed EEG signal into statistically
+    independent source signals ("components"). Some components correspond to
+    artifacts: eye blinks appear as large deflections in frontal channels,
+    heartbeat as a periodic signal across all channels.
+
+    These artifact components can be identified by index and excluded —
+    their contribution is subtracted from all channels simultaneously.
+
+    Uses MNE's ICA implementation which applies FastICA under the hood.
+
+    IMPORTANT: Apply AFTER bandpass filtering, BEFORE windowing and normalization.
+    ICA on unfiltered signals is unreliable (DC drift dominates components).
+    ICA on normalized signals changes the signal statistics ICA relies on.
+
+    WARNING: ICA fitting is computationally expensive on long recordings.
+             It may take several minutes on CPU for recordings > 5 minutes.
+    """
+
+    def __init__(
+        self,
+        n_components: int | None = None,
+        exclude_indices: list[int] | None = None,
+    ) -> None:
+        """
+        Args:
+            n_components:    Number of ICA components to compute.
+                             Default = number of channels (full decomposition).
+            exclude_indices: Which component indices to remove (e.g. [0, 1]).
+                             These are identified by the user inspecting component
+                             topomaps (in future UI). If None, no components removed.
+        """
+        self.n_components    = n_components
+        self.exclude_indices = exclude_indices or []
+
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
+        """
+        Fit ICA on the signals and apply it, optionally excluding artifact components.
+
+        If exclude_indices is empty, returns the signal reconstructed from all
+        components (effectively a no-op for the signal, but the ICA is still fit).
+        """
+        try:
+            import mne
+        except ImportError as exc:
+            raise ImportError(
+                "MNE-Python is required for ICA filtering. "
+                "Install it with: pip install mne"
+            ) from exc
+
+        n_channels, n_samples = signals.shape
+        n_components = self.n_components or n_channels
+
+        # Cap n_components at n_channels (ICA cannot produce more components than inputs)
+        n_components = min(n_components, n_channels)
+
+        # Build an MNE RawArray so we can use MNE's ICA class.
+        # MNE expects (n_channels, n_samples) shape — matches our convention.
+        info = mne.create_info(
+            ch_names=channel_names or [f"ch_{i}" for i in range(n_channels)],
+            sfreq=float(sample_rate),
+            ch_types="eeg",
+        )
+        raw = mne.io.RawArray(signals.astype(np.float64), info, verbose=False)
+
+        # Fit ICA.
+        # method='fastica' is the standard algorithm for EEG.
+        # random_state=42 makes the decomposition reproducible.
+        ica = mne.preprocessing.ICA(
+            n_components=n_components,
+            method="fastica",
+            random_state=42,
+            verbose=False,
+        )
+
+        logger.info(
+            "Fitting ICA: %d components on signal (%d ch, %d samples)...",
+            n_components, n_channels, n_samples,
+        )
+        ica.fit(raw, verbose=False)
+
+        # Exclude specified artifact components
+        if self.exclude_indices:
+            ica.exclude = self.exclude_indices
+            logger.info("ICA excluding components: %s", self.exclude_indices)
+
+        # Apply ICA — reconstruct signal without the excluded components
+        raw_cleaned = ica.apply(raw.copy(), verbose=False)
+
+        # Extract the cleaned signal back to numpy
+        cleaned = raw_cleaned.get_data().astype(np.float32)
+        logger.info("ICA applied. Signal shape: %s", cleaned.shape)
+
+        return cleaned
+
+    def to_dict(self) -> dict:
+        return {
+            "step":            "ica",
+            "n_components":    self.n_components,
+            "exclude_indices": self.exclude_indices,
+        }
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "ICAFilter":
+        return cls(
+            n_components=   config.get("n_components"),
+            exclude_indices=config.get("exclude_indices", []),
+        )
+
+
+# ---------------------------------------------------------------------------
 # STEP_REGISTRY — maps JSON "step" strings to their classes
 # ---------------------------------------------------------------------------
 
@@ -384,6 +769,10 @@ STEP_REGISTRY: dict[str, type[PreprocessingStep]] = {
     "notch":     NotchFilter,
     "normalize": Normalize,
     "window":    SlidingWindow,
+    "reref":     Rereferencing,
+    "reject":    EpochRejection,
+    "channels":  ChannelSelector,
+    "ica":       ICAFilter,
 }
 
 
@@ -420,11 +809,14 @@ class Pipeline:
         """
         Apply all steps to the session's signals and return windowed output.
 
-        The pipeline applies steps in order:
-          1. All non-SlidingWindow steps transform (n_channels, n_samples) → (n_channels, n_samples)
-          2. SlidingWindow (if present, always last) produces list[np.ndarray]
-          3. If no SlidingWindow, wrap the final signal in a single-element list
-             so the return type is always list[np.ndarray]
+        Step ordering (enforced internally regardless of config order):
+          1. Pre-window steps (Bandpass, Notch, Normalize, Rereferencing, ChannelSelector,
+             ICAFilter) — transform (n_channels, n_samples) → (n_channels, n_samples)
+          2. SlidingWindow (if present) — produces list[np.ndarray]
+          3. Post-window steps (EpochRejection) — filter the window list
+
+        ChannelSelector tracking: after ChannelSelector runs, the pipeline tracks
+        the new (reduced) channel list so subsequent steps receive the right names.
 
         Args:
             session: The DataSession to process.
@@ -434,26 +826,48 @@ class Pipeline:
         """
         signals = session.signals.copy()  # don't mutate the original session data
         sample_rate = session.sample_rate
+        # Track the current channel names — may be reduced by ChannelSelector
+        channel_names = list(session.channel_names)
 
-        # Separate SlidingWindow from the other steps.
-        # We process it last so all filtering happens on the full-length signal.
-        # Filtering windowed segments separately would cause edge effects at each
-        # window boundary.
-        filter_steps = [s for s in self.steps if not isinstance(s, SlidingWindow)]
-        window_step = next((s for s in self.steps if isinstance(s, SlidingWindow)), None)
+        # Partition steps by phase: pre-window, window, post-window
+        pre_window_steps = [
+            s for s in self.steps
+            if not isinstance(s, (SlidingWindow, EpochRejection))
+        ]
+        window_step = next(
+            (s for s in self.steps if isinstance(s, SlidingWindow)), None
+        )
+        post_window_steps = [
+            s for s in self.steps if isinstance(s, EpochRejection)
+        ]
 
-        # Apply all filter/normalization steps sequentially
-        for step in filter_steps:
+        # Phase 1: Apply all pre-window steps on the full continuous signal.
+        # Filtering the whole signal before windowing prevents edge effects
+        # (filter transients) at every window boundary.
+        for step in pre_window_steps:
             logger.info("Applying step: %s", step.to_dict())
-            signals = step.apply(signals, sample_rate)
+            signals = step.apply(signals, sample_rate, channel_names)
 
-        # Apply windowing last (changes return type)
+            # If ChannelSelector ran, update the tracked channel names
+            # to match the reduced channel set it selected.
+            if isinstance(step, ChannelSelector):
+                channel_names = step.channels
+
+        # Phase 2: Apply windowing (changes return type to list[np.ndarray])
         if window_step is not None:
-            return window_step.apply(signals, sample_rate)
+            logger.info("Applying step: %s", window_step.to_dict())
+            windows = window_step.apply(signals, sample_rate, channel_names)
         else:
             # No windowing — wrap the full processed signal so the return type
             # is always list[np.ndarray], making downstream code uniform.
-            return [signals]
+            windows = [signals]
+
+        # Phase 3: Apply post-window steps (EpochRejection filters out bad windows)
+        for step in post_window_steps:
+            logger.info("Applying epoch rejection: %s", step.to_dict())
+            windows = step.apply_to_windows(windows, sample_rate)
+
+        return windows
 
     def to_dict(self) -> dict:
         """

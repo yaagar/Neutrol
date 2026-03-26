@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # Import all routers — implemented and stub alike
 from api.data_routes     import router as data_router
 from api.pipeline_routes import router as pipeline_router
+from api.analysis_routes import router as analysis_router
 from api.label_routes    import router as label_router
 from api.train_routes    import router as train_router
 from api.inference_routes import router as inference_router
@@ -42,10 +43,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="OpenEEG API",
+    title="Neutrol API",
     description=(
-        "Backend API for the OpenEEG platform. "
-        "Handles EEG file loading, preprocessing, labeling, training, and inference."
+        "Backend API for the Neutrol EEG platform. "
+        "Handles EEG file loading, preprocessing, signal analysis, labeling, training, and inference."
     ),
     version="0.1.0",
     # FastAPI generates interactive docs at /docs (Swagger UI) and /redoc automatically.
@@ -79,6 +80,7 @@ app.add_middleware(
 
 app.include_router(data_router,     prefix="/api/data",      tags=["Data"])
 app.include_router(pipeline_router, prefix="/api/pipeline",  tags=["Pipeline"])
+app.include_router(analysis_router, prefix="/api/analysis",  tags=["Analysis"])
 app.include_router(label_router,    prefix="/api/labels",    tags=["Labels"])
 app.include_router(train_router,    prefix="/api/train",     tags=["Training"])
 app.include_router(inference_router,prefix="/api/inference", tags=["Inference"])
