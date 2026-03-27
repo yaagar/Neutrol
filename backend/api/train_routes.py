@@ -73,6 +73,35 @@ class ValidateConfigRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/train/jobs — list all training jobs
+# ---------------------------------------------------------------------------
+
+@router.get("/jobs")
+async def list_jobs() -> JSONResponse:
+    """
+    Return a summary of all training jobs (running, done, or failed).
+    Used by the Inference page to populate the model selector dropdown.
+    """
+    jobs = []
+    for job_id, job in store.training_jobs.items():
+        history = job.get("history", [])
+        final   = history[-1] if history else {}
+        jobs.append({
+            "job_id":         job_id,
+            "session_id":     job.get("session_id"),
+            "status":         job.get("status"),
+            "started_at":     job.get("started_at"),
+            "final_val_acc":  final.get("val_acc"),
+            "epochs_run":     len(history),
+            "classes":        job.get("class_names", []),
+            "model_path":     job.get("model_path"),
+        })
+    # Most recent first
+    jobs.sort(key=lambda j: j["started_at"] or "", reverse=True)
+    return JSONResponse(status_code=200, content=api_response(True, data={"jobs": jobs}))
+
+
+# ---------------------------------------------------------------------------
 # GET /api/train/layer-types
 # ---------------------------------------------------------------------------
 
