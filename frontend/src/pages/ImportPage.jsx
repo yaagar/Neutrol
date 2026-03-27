@@ -1,44 +1,43 @@
 // ImportPage.jsx — EEG file upload, session manager, and waveform preview
 //
-// This page is the entry point of the entire workflow.
-// Three sections stacked vertically:
+// Three sections:
 //   1. Upload zone — drop or click to select a .csv or .edf file
-//   2. Session list — all loaded sessions; click one to make it active
-//   3. Waveform preview — chart of the active session's signals
+//   2. Session list — all loaded sessions; click to make active, pencil to rename
+//   3. Waveform preview — chart of the active session's signals with channel toggles
 import { useState, useEffect, useRef } from 'react'
 import { useSession } from '../hooks/useSession'
+import useAppStore from '../store/appStore'
 import WaveformChart from '../components/WaveformChart'
 
 import { API_BASE_URL } from '../config'
 const API = API_BASE_URL
 
 export default function ImportPage() {
-  // Read session state and write actions from the Zustand store
   const { currentSession, sessions, setCurrentSession, setSessions, addSession, removeSession } =
     useSession()
+  const sessionNicknames   = useAppStore(s => s.sessionNicknames)
+  const setSessionNickname = useAppStore(s => s.setSessionNickname)
 
-  // Local state for this page only (not needed by other pages, so not in Zustand)
-  const [uploading, setUploading]       = useState(false)   // is a file upload in progress?
-  const [uploadError, setUploadError]   = useState(null)    // error string from last upload
-  const [uploadSuccess, setUploadSuccess] = useState(false) // show green confirmation briefly
-  const [isDragOver, setIsDragOver]     = useState(false)   // drag-and-drop hover state
-  const [previewData, setPreviewData]   = useState(null)    // waveform chart data for current session
+  const [uploading, setUploading]           = useState(false)
+  const [uploadError, setUploadError]       = useState(null)
+  const [uploadSuccess, setUploadSuccess]   = useState(false)
+  const [isDragOver, setIsDragOver]         = useState(false)
+  const [previewData, setPreviewData]       = useState(null)
   const [previewLoading, setPreviewLoading] = useState(false)
-  const [visibleChannels, setVisibleChannels] = useState([]) // which channels to show in chart
-  const fileInputRef = useRef(null)                         // hidden <input type="file"> ref
+  const [visibleChannels, setVisibleChannels] = useState([])
 
-  // On mount: load all existing sessions from the backend.
-  // This handles the case where the user navigates away and comes back —
-  // sessions stay in the backend memory even if Zustand is reset on hot reload.
-  useEffect(() => {
-    fetchSessions()
-  }, [])
+  // Which session is currently being renamed (its session_id), and the draft text
+  const [renamingId, setRenamingId]     = useState(null)
+  const [renameDraft, setRenameDraft]   = useState('')
+  const renameInputRef                  = useRef(null)
 
-  // When the active session changes, fetch its waveform preview data.
+  const fileInputRef = useRef(null)
+
+  useEffect(() => { fetchSessions() }, [])
+
   useEffect(() => {
     if (currentSession) {
       fetchPreview(currentSession.session_id)
-      // Default: show all channels
       setVisibleChannels(currentSession.channel_names)
     } else {
       setPreviewData(null)
@@ -46,68 +45,56 @@ export default function ImportPage() {
     }
   }, [currentSession?.session_id])
 
+  // Focus the rename input as soon as it appears
+  useEffect(() => {
+    if (renamingId) renameInputRef.current?.focus()
+  }, [renamingId])
+
   // -------------------------------------------------------------------------
-  // API helpers — all use async/await as required by CLAUDE.md
+  // API helpers
   // -------------------------------------------------------------------------
 
   async function fetchSessions() {
     try {
-      const res = await fetch(`${API}/api/data/sessions`)
+      const res  = await fetch(`${API}/api/data/sessions`)
       const json = await res.json()
       if (json.success) {
         setSessions(json.data)
-        // If there's no current session but sessions exist, auto-select the first one
-        if (!currentSession && json.data.length > 0) {
-          setCurrentSession(json.data[0])
-        }
+        if (!currentSession && json.data.length > 0) setCurrentSession(json.data[0])
       }
-    } catch {
-      // Network error — backend likely not running. Don't crash, just show nothing.
-    }
+    } catch { /* backend not running — show nothing */ }
   }
 
   async function fetchPreview(sessionId) {
     setPreviewLoading(true)
     try {
-      // max_samples=512 keeps chart rendering fast even for long recordings
-      const res = await fetch(`${API}/api/data/${sessionId}/preview?max_samples=512`)
+      const res  = await fetch(`${API}/api/data/${sessionId}/preview?max_samples=512`)
       const json = await res.json()
-      if (json.success) {
-        setPreviewData(json.data)
-      }
-    } catch {
-      setPreviewData(null)
-    } finally {
-      setPreviewLoading(false)
-    }
+      if (json.success) setPreviewData(json.data)
+    } catch { setPreviewData(null) }
+    finally { setPreviewLoading(false) }
   }
 
   async function uploadFile(file) {
-    // Validate extension before sending — gives instant feedback, avoids wasted round-trip
     const ext = file.name.split('.').pop().toLowerCase()
     if (ext !== 'csv' && ext !== 'edf') {
       setUploadError(`Unsupported file type ".${ext}". Please upload a .csv or .edf file.`)
       return
     }
-
     setUploading(true)
     setUploadError(null)
     setUploadSuccess(false)
 
-    // FormData is required for multipart file uploads
     const form = new FormData()
     form.append('file', file)
 
     try {
-      const res = await fetch(`${API}/api/data/upload`, { method: 'POST', body: form })
+      const res  = await fetch(`${API}/api/data/upload`, { method: 'POST', body: form })
       const json = await res.json()
-
       if (json.success) {
-        // Add the new session to the Zustand store and make it the active session
         addSession(json.data)
         setCurrentSession(json.data)
         setUploadSuccess(true)
-        // Clear the success message after 3 seconds
         setTimeout(() => setUploadSuccess(false), 3000)
       } else {
         setUploadError(json.error || 'Upload failed.')
@@ -121,55 +108,56 @@ export default function ImportPage() {
 
   async function deleteSession(sessionId) {
     try {
-      const res = await fetch(`${API}/api/data/${sessionId}`, { method: 'DELETE' })
+      const res  = await fetch(`${API}/api/data/${sessionId}`, { method: 'DELETE' })
       const json = await res.json()
-      if (json.success) {
-        // Update Zustand — removeSession also clears currentSession if it was the deleted one
-        removeSession(sessionId)
-      }
-    } catch {
-      // Silently ignore delete errors — worst case the session stays listed
-    }
+      if (json.success) removeSession(sessionId)
+    } catch { /* ignore */ }
   }
 
   // -------------------------------------------------------------------------
-  // Drag-and-drop handlers
+  // Rename helpers
   // -------------------------------------------------------------------------
 
-  function onDragOver(e) {
-    e.preventDefault()   // required to allow drop
-    setIsDragOver(true)
+  function startRename(session, e) {
+    e.stopPropagation()
+    const current = sessionNicknames[session.session_id] ||
+      session.file_path?.split(/[\\/]/).pop() || ''
+    setRenamingId(session.session_id)
+    setRenameDraft(current)
   }
 
-  function onDragLeave() {
-    setIsDragOver(false)
+  function commitRename() {
+    if (renamingId) setSessionNickname(renamingId, renameDraft.trim())
+    setRenamingId(null)
   }
 
-  function onDrop(e) {
-    e.preventDefault()
-    setIsDragOver(false)
-    const file = e.dataTransfer.files[0]
-    if (file) uploadFile(file)
+  function onRenameKeyDown(e) {
+    if (e.key === 'Enter') commitRename()
+    if (e.key === 'Escape') setRenamingId(null)
   }
 
-  function onFileInputChange(e) {
-    const file = e.target.files[0]
-    if (file) uploadFile(file)
-    // Reset the input so the same file can be re-uploaded if needed
-    e.target.value = ''
-  }
+  // -------------------------------------------------------------------------
+  // Drag-and-drop
+  // -------------------------------------------------------------------------
 
-  // Toggle a channel on/off in the waveform chart
+  function onDragOver(e)  { e.preventDefault(); setIsDragOver(true) }
+  function onDragLeave()  { setIsDragOver(false) }
+  function onDrop(e)      { e.preventDefault(); setIsDragOver(false); const f = e.dataTransfer.files[0]; if (f) uploadFile(f) }
+  function onFileInputChange(e) { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = '' }
   function toggleChannel(name) {
-    setVisibleChannels(prev =>
-      prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]
-    )
+    setVisibleChannels(prev => prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name])
+  }
+
+  // Helper: display name for a session (nickname → filename → id)
+  function displayName(session) {
+    return sessionNicknames[session.session_id] ||
+      session.file_path?.split(/[\\/]/).pop() ||
+      session.session_id.slice(0, 8) + '…'
   }
 
   // -------------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------------
-
   return (
     <div className="max-w-4xl">
       <h1 className="text-2xl font-bold text-gray-100 mb-1">Import</h1>
@@ -185,7 +173,6 @@ export default function ImportPage() {
           Upload File
         </h2>
 
-        {/* The visible drop zone — clicking it triggers the hidden file input */}
         <div
           onClick={() => fileInputRef.current?.click()}
           onDragOver={onDragOver}
@@ -201,7 +188,12 @@ export default function ImportPage() {
           `}
         >
           {uploading ? (
-            <p className="text-gray-300">Uploading and parsing file…</p>
+            <div>
+              <div className="flex justify-center mb-2">
+                <span className="animate-spin text-purple-400 text-2xl">↻</span>
+              </div>
+              <p className="text-gray-300">Uploading and parsing file…</p>
+            </div>
           ) : (
             <>
               <p className="text-gray-300 font-medium">Drop a file here, or click to browse</p>
@@ -210,25 +202,16 @@ export default function ImportPage() {
           )}
         </div>
 
-        {/* Hidden file input — triggered by clicking the drop zone above */}
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".csv,.edf"
-          className="hidden"
-          onChange={onFileInputChange}
-        />
+        <input ref={fileInputRef} type="file" accept=".csv,.edf" className="hidden" onChange={onFileInputChange} />
 
-        {/* Upload success message */}
         {uploadSuccess && (
-          <p className="mt-3 text-green-400 text-sm">
-            File uploaded successfully. Session created.
-          </p>
+          <p className="mt-3 text-green-400 text-sm">File uploaded successfully. Session created.</p>
         )}
-
-        {/* Upload error message */}
         {uploadError && (
-          <p className="mt-3 text-red-400 text-sm">{uploadError}</p>
+          <div className="mt-3 bg-red-900/20 border border-red-800 rounded-lg p-3">
+            <p className="text-red-400 text-sm">{uploadError}</p>
+            <button onClick={() => setUploadError(null)} className="text-xs text-red-500 hover:text-red-400 mt-1">Dismiss</button>
+          </div>
         )}
       </section>
 
@@ -236,65 +219,91 @@ export default function ImportPage() {
       {/* Section 2: Session list                                              */}
       {/* ------------------------------------------------------------------ */}
       <section className="mb-10">
-        <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
-          Loaded Sessions ({sessions.length})
-        </h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
+            Loaded Sessions ({sessions.length})
+          </h2>
+          {sessions.length > 0 && (
+            <button onClick={fetchSessions} className="text-xs text-gray-600 hover:text-gray-400 transition-colors">
+              Refresh
+            </button>
+          )}
+        </div>
 
         {sessions.length === 0 ? (
-          <p className="text-gray-600 text-sm">
-            No sessions loaded. Upload a file above to get started.
-          </p>
+          <div className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-8 text-center">
+            <p className="text-gray-500 text-sm">No sessions loaded yet.</p>
+            <p className="text-gray-600 text-xs mt-1">Upload a .csv or .edf file above to get started.</p>
+          </div>
         ) : (
           <ul className="flex flex-col gap-2">
             {sessions.map(session => {
-              const isActive = currentSession?.session_id === session.session_id
+              const isActive  = currentSession?.session_id === session.session_id
+              const isRenaming = renamingId === session.session_id
+
               return (
                 <li
                   key={session.session_id}
+                  onClick={() => !isRenaming && setCurrentSession(session)}
                   className={`
                     rounded-lg border px-4 py-3 flex items-center justify-between gap-4
-                    transition-colors
+                    transition-colors cursor-pointer
                     ${isActive
                       ? 'border-purple-500 bg-purple-900/20'
                       : 'border-gray-700 bg-gray-900/40 hover:border-gray-600'
                     }
                   `}
                 >
-                  {/* Session metadata */}
+                  {/* Left: name + stats */}
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1">
                       {isActive && (
-                        <span className="text-xs bg-purple-600 text-white px-2 py-0.5 rounded-full font-medium">
+                        <span className="text-xs bg-purple-600 text-white px-2 py-0.5 rounded-full font-medium shrink-0">
                           Active
                         </span>
                       )}
-                      {/* Show filename from file_path, falling back to truncated session ID */}
-                      <span className="text-gray-200 text-sm font-mono truncate">
-                        {session.file_path
-                          ? session.file_path.split(/[\\/]/).pop()
-                          : session.session_id.slice(0, 8) + '…'}
-                      </span>
+
+                      {/* Inline rename input or display name */}
+                      {isRenaming ? (
+                        <input
+                          ref={renameInputRef}
+                          value={renameDraft}
+                          onChange={e => setRenameDraft(e.target.value)}
+                          onBlur={commitRename}
+                          onKeyDown={onRenameKeyDown}
+                          onClick={e => e.stopPropagation()}
+                          className="flex-1 bg-gray-700 border border-purple-500 text-gray-100 text-sm rounded px-2 py-0.5 focus:outline-none"
+                        />
+                      ) : (
+                        <span className="text-gray-200 text-sm font-medium truncate">
+                          {displayName(session)}
+                        </span>
+                      )}
+
+                      {/* Pencil icon to start renaming */}
+                      {!isRenaming && (
+                        <button
+                          onClick={e => startRename(session, e)}
+                          title="Rename session"
+                          className="text-gray-600 hover:text-gray-400 transition-colors shrink-0 text-xs"
+                        >
+                          ✎
+                        </button>
+                      )}
                     </div>
+
                     <div className="flex gap-4 text-xs text-gray-500">
                       <span>{session.n_channels} channels</span>
                       <span>{session.sample_rate} Hz</span>
                       <span>{session.duration_seconds?.toFixed(1)}s</span>
-                      <span className="text-gray-600 font-mono">{session.session_id.slice(0, 8)}…</span>
+                      <span className="text-gray-700 font-mono">{session.session_id.slice(0, 8)}…</span>
                     </div>
                   </div>
 
-                  {/* Actions */}
+                  {/* Right: actions */}
                   <div className="flex items-center gap-2 shrink-0">
-                    {!isActive && (
-                      <button
-                        onClick={() => setCurrentSession(session)}
-                        className="text-xs text-purple-400 hover:text-purple-300 transition-colors px-2 py-1 border border-purple-700 rounded hover:border-purple-500"
-                      >
-                        Set Active
-                      </button>
-                    )}
                     <button
-                      onClick={() => deleteSession(session.session_id)}
+                      onClick={e => { e.stopPropagation(); deleteSession(session.session_id) }}
                       className="text-xs text-red-500 hover:text-red-400 transition-colors px-2 py-1 border border-red-900 rounded hover:border-red-700"
                     >
                       Delete
@@ -308,15 +317,14 @@ export default function ImportPage() {
       </section>
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 3: Waveform preview (only shown when a session is active)   */}
+      {/* Section 3: Waveform preview                                          */}
       {/* ------------------------------------------------------------------ */}
       {currentSession && (
         <section>
           <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
-            Waveform Preview — {currentSession.file_path?.split(/[\\/]/).pop()}
+            Waveform Preview — {displayName(currentSession)}
           </h2>
 
-          {/* Channel toggles — let the user show/hide individual channels */}
           {currentSession.channel_names && (
             <div className="flex flex-wrap gap-2 mb-4">
               {currentSession.channel_names.map(name => (
@@ -337,18 +345,14 @@ export default function ImportPage() {
             </div>
           )}
 
-          {/* Chart area */}
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
             {previewLoading ? (
-              <div className="flex items-center justify-center h-48 text-gray-500 text-sm">
-                Loading waveform…
+              <div className="flex items-center justify-center h-48 text-gray-500 text-sm gap-2">
+                <span className="animate-spin">↻</span>
+                <span>Loading waveform…</span>
               </div>
             ) : previewData ? (
-              <WaveformChart
-                data={previewData.points}
-                channelNames={visibleChannels}
-                height={280}
-              />
+              <WaveformChart data={previewData.points} channelNames={visibleChannels} height={280} />
             ) : (
               <div className="flex items-center justify-center h-48 text-gray-600 text-sm">
                 Could not load waveform data.
@@ -356,11 +360,9 @@ export default function ImportPage() {
             )}
           </div>
 
-          {/* Preview metadata */}
           {previewData && (
             <p className="text-xs text-gray-600 mt-2">
-              Showing {previewData.n_samples_preview} of {previewData.n_samples_original} samples
-              (downsampled for display)
+              Showing {previewData.n_samples_preview} of {previewData.n_samples_original} samples (downsampled for display)
             </p>
           )}
         </section>

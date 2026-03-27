@@ -1,98 +1,131 @@
-# OpenEEG
+# Neutrol — EEG Development Platform
 
-An open-source, beginner-friendly EEG development platform.
+An open-source, beginner-friendly platform for EEG signal processing, model training, and inference. Simple enough for a student on day one, fully editable for an expert.
 
-EEG (electroencephalography) measures electrical brain activity through electrodes on the scalp. The raw output is a set of voltage signals over time — one per electrode (channel). To do anything useful with it, you need to clean the signal, segment it into windows, label those windows, train a model, and then run that model in real time.
-
-**OpenEEG does all of that in one place.** The design goal is the same as the Arduino IDE: simple enough for a student on day one, fully editable for an expert.
-
-**User workflow:**
+**Full workflow:**
 ```
-Import EEG file → Preprocess signal → Label segments → Train CNN → Live predictions → Export
+Import EEG → Preprocess → Label → Train → Inference → Export
 ```
 
 ---
 
-## How to Run
+## Requirements
 
-### Backend
+- Python 3.11+
+- Node.js 18+
 
+---
+
+## Quick Start
+
+**Terminal 1 — Backend:**
 ```bash
 cd backend
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-The API runs at **http://localhost:8000**
-Interactive API docs (Swagger UI): **http://localhost:8000/docs**
-
-### Frontend
-
+**Terminal 2 — Frontend:**
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-The app runs at **http://localhost:5173**
+Open `http://localhost:5173`. API docs at `http://localhost:8000/docs`.
 
 ---
 
-## What Session 1 Built
+## Workflow
 
-**Project scaffold** — the complete directory structure, all config files, and all empty placeholder files that future sessions will fill in.
+### 1 — Import
+Upload a `.csv` or `.edf` EEG recording. Multiple sessions can be loaded and switched between.
 
-**Data import backend** (`backend/core/data_loader.py`, `backend/api/data_routes.py`):
-- Upload `.csv` or `.edf` EEG files via `POST /api/data/upload`
-- Sessions are stored in memory (no database) and identified by a UUID
-- List, get, and delete sessions via `GET /api/data/sessions`, `GET /api/data/{id}`, `DELETE /api/data/{id}`
+- Drag and drop or click to browse
+- Rename sessions with the pencil icon (✎)
+- Preview the raw waveform with per-channel toggles
 
-**Preprocessing pipeline backend** (`backend/core/preprocessing.py`, `backend/api/pipeline_routes.py`):
-- Four preprocessing steps: `BandpassFilter`, `NotchFilter`, `Normalize`, `SlidingWindow`
-- Steps serialize to/from JSON so pipelines can be saved and reloaded exactly
-- Run a pipeline on a session via `POST /api/pipeline/run`
-- List available steps, save configs, list saved configs
+### 2 — Preprocess
+Build a preprocessing pipeline by chaining steps. Steps run in order on the raw signal.
 
-**Sample data** (`datasets/sample_eeg.csv`):
-- 8 channels (Fp1, Fp2, C3, C4, O1, O2, T3, T4)
-- 10 seconds at 256 Hz (2560 rows)
-- Each channel is a sine wave at a unique frequency (6–25 Hz) with small random noise
+| Step | What it does |
+|---|---|
+| Truncate Signal | Crop to a time range |
+| Bandpass Filter | Keep only frequencies in a band (e.g. 1–40 Hz) |
+| Notch Filter | Remove power line noise (e.g. 60 Hz) |
+| Channel Selector | Drop channels you don't need |
+| Re-reference | Subtract average or linked mastoid reference |
+| Normalize | Z-score or min-max per channel |
+| Sliding Window | Chop into fixed-length overlapping windows |
+| Epoch Rejection | Discard windows with artifact spikes |
+
+**Tips:**
+- Use ↑ ↓ to reorder steps without deleting them
+- Use ⧉ to duplicate a step and tweak parameters
+- The Before/After toggle shows exactly what each filter does to the signal
+
+### 3 — Label
+Assign class labels to windows. Two methods:
+
+- **Manual** — navigate window by window, click a label
+- **Auto from event file** — upload `.edf.event`, `.tsv`, `.eve`, or `.vmrk` and labels apply automatically from event timestamps
+
+### 4 — Train
+Design a neural network architecture with the layer editor, then start training. Loss and accuracy stream live via WebSocket. View the confusion matrix when done.
+
+Default architecture: EEGNet-inspired (Conv2d → DepthwiseConv2d → AvgPool → Dropout → Flatten → Linear)
+
+### 5 — Inference
+Select a trained model and a pipeline run, then stream live predictions at a configurable speed (100 ms – 2 s per window).
+
+### 6 — Export
+Download everything needed to use your model outside Neutrol:
+
+| File | What it is |
+|---|---|
+| `.pt` | PyTorch model weights |
+| `.py` | Standalone inference script (only needs `torch` + `numpy`) |
+| `.json` | Pipeline configuration |
+
+**Using the inference script:**
+```bash
+python neutrol_inference_<id>.py   # self-test
+```
+```python
+from neutrol_inference_<id> import predict
+import numpy as np
+
+window = np.zeros((8, 256), dtype=np.float32)  # (n_channels, n_samples)
+result = predict(window)
+# {"class": "T1", "confidence": 0.87, "probabilities": {...}}
+```
+
+Keep the `.py` and `.pt` files in the same folder. No Neutrol installation needed.
 
 ---
 
 ## Directory Structure
 
 ```
+Neutrol/
 ├── backend/
-│   ├── main.py               FastAPI app, CORS, all routers
-│   ├── requirements.txt      Python dependencies
-│   ├── api/                  Route handlers (HTTP layer only)
-│   ├── core/                 All signal processing logic (no HTTP)
-│   ├── sessions/             In-memory singleton data store
-│   └── plugins/              Empty — future custom steps/models
+│   ├── main.py           FastAPI app, CORS, all routers
+│   ├── api/              HTTP route handlers (no logic)
+│   └── core/             Signal processing, training, inference
 ├── frontend/
 │   └── src/
-│       ├── App.jsx           Two-column layout (sidebar + content)
-│       ├── pages/            One page per workflow step
-│       ├── components/       Reusable UI components
-│       ├── hooks/            useSession, useWebSocket
-│       └── store/            Zustand global state
-├── configs/                  Saved pipeline JSON files
-├── datasets/                 Sample EEG data
-└── exports/                  Exported models and scripts
+│       ├── pages/        One page per workflow step
+│       ├── components/   Sidebar, charts, layer editor
+│       └── store/        Zustand global state
+├── exports/              Saved model weights (.pt)
+├── configs/              Saved pipeline configs (.json)
+└── datasets/             Sample EEG data
 ```
 
 ---
 
-## Session Roadmap
+## Sample Data
 
-| Session | What gets built |
-|---|---|
-| **1** ✅ | Project scaffold + data import + preprocessing backend |
-| **2** | Import page UI + session manager + waveform display |
-| **3** | Labeling page UI + label save/load API |
-| **4** | CNN model + training endpoint + training WebSocket |
-| **5** | Training results page (loss curves, confusion matrix) |
-| **6** | Inference engine + real-time prediction WebSocket + page |
-| **7** | Export system (pipeline JSON, model weights, inference script) |
-| **8** | Pipeline builder UI + session polish |
+`datasets/sample_eeg.csv` — synthetic 8-channel EEG at 256 Hz, 10 seconds.
+
+PhysioNet EDF files (e.g. `S001R03.edf`) with embedded motor imagery annotations work out of the box — upload the `.edf` and use auto-labeling on the Label page.

@@ -319,6 +319,26 @@ export default function PreprocessPage() {
     setPreprocessPageState({ pipelineSteps: pipelineSteps.filter((_, i) => i !== idx) })
   }
 
+  function moveStepUp(idx) {
+    if (idx === 0) return
+    const updated = [...pipelineSteps]
+    ;[updated[idx - 1], updated[idx]] = [updated[idx], updated[idx - 1]]
+    setPreprocessPageState({ pipelineSteps: updated })
+  }
+
+  function moveStepDown(idx) {
+    if (idx === pipelineSteps.length - 1) return
+    const updated = [...pipelineSteps]
+    ;[updated[idx], updated[idx + 1]] = [updated[idx + 1], updated[idx]]
+    setPreprocessPageState({ pipelineSteps: updated })
+  }
+
+  function duplicateStep(idx) {
+    const updated = [...pipelineSteps]
+    updated.splice(idx + 1, 0, { ...pipelineSteps[idx] })
+    setPreprocessPageState({ pipelineSteps: updated })
+  }
+
   function updateStepField(idx, key, value) {
     const updated = [...pipelineSteps]
     const numVal  = parseFloat(value)
@@ -346,9 +366,16 @@ export default function PreprocessPage() {
   // -------------------------------------------------------------------------
   if (!currentSession) {
     return (
-      <div className="p-6">
+      <div className="p-6 max-w-lg">
         <h1 className="text-2xl font-bold text-gray-100 mb-2">Preprocess</h1>
-        <p className="text-gray-400">No session loaded. Go to Import and upload an EEG file first.</p>
+        <div className="bg-gray-900 border border-gray-800 rounded-xl px-5 py-8 text-center mt-6">
+          <p className="text-gray-400 text-sm mb-2">No session loaded.</p>
+          <p className="text-gray-600 text-xs">
+            Go to{' '}
+            <a href="/import" className="text-purple-400 hover:underline">Import</a>{' '}
+            and upload an EEG file first.
+          </p>
+        </div>
       </div>
     )
   }
@@ -377,7 +404,17 @@ export default function PreprocessPage() {
 
         {/* Pipeline steps */}
         <div className="bg-gray-800 rounded-lg p-3">
-          <p className="text-xs font-semibold text-gray-400 uppercase mb-2">Pipeline Steps</p>
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-xs font-semibold text-gray-400 uppercase">Pipeline Steps</p>
+            {pipelineSteps.length > 0 && (
+              <button
+                onClick={() => setPreprocessPageState({ pipelineSteps: [] })}
+                className="text-xs text-gray-600 hover:text-red-400 transition-colors"
+              >
+                Clear all
+              </button>
+            )}
+          </div>
 
           {pipelineSteps.length === 0 && (
             <p className="text-xs text-gray-500 mb-2">No steps. Add steps below.</p>
@@ -393,12 +430,39 @@ export default function PreprocessPage() {
                     <span className="text-xs font-medium text-blue-300">
                       {preset?.label || stepConfig.step}
                     </span>
-                    <button
-                      onClick={() => removeStep(idx)}
-                      className="text-red-400 hover:text-red-300 text-xs px-1"
-                    >
-                      ✕
-                    </button>
+                    {/* Step controls: move up, move down, duplicate, remove */}
+                    <div className="flex items-center gap-0.5">
+                      <button
+                        onClick={() => moveStepUp(idx)}
+                        disabled={idx === 0}
+                        title="Move up"
+                        className="text-gray-400 hover:text-gray-200 disabled:opacity-20 text-xs px-1 leading-none"
+                      >
+                        ↑
+                      </button>
+                      <button
+                        onClick={() => moveStepDown(idx)}
+                        disabled={idx === pipelineSteps.length - 1}
+                        title="Move down"
+                        className="text-gray-400 hover:text-gray-200 disabled:opacity-20 text-xs px-1 leading-none"
+                      >
+                        ↓
+                      </button>
+                      <button
+                        onClick={() => duplicateStep(idx)}
+                        title="Duplicate step"
+                        className="text-gray-400 hover:text-blue-300 text-xs px-1 leading-none"
+                      >
+                        ⧉
+                      </button>
+                      <button
+                        onClick={() => removeStep(idx)}
+                        title="Remove step"
+                        className="text-red-400 hover:text-red-300 text-xs px-1 leading-none"
+                      >
+                        ✕
+                      </button>
+                    </div>
                   </div>
 
                   {/* Regular fields */}

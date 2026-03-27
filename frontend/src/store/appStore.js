@@ -55,6 +55,14 @@ const useAppStore = create((set) => ({
         state.currentSession?.session_id === sessionId ? null : state.currentSession,
     })),
 
+  // Human-readable nicknames for sessions, keyed by session_id.
+  // Stored client-side only — resets on page refresh (consistent with in-memory backend).
+  sessionNicknames: {},
+  setSessionNickname: (sessionId, nickname) =>
+    set((state) => ({
+      sessionNicknames: { ...state.sessionNicknames, [sessionId]: nickname },
+    })),
+
   // Save the pipeline config the user has built.
   setPipelineConfig: (config) => set({ pipelineConfig: config }),
 
