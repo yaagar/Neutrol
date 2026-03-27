@@ -114,6 +114,7 @@ async def run_pipeline(request: RunPipelineRequest) -> JSONResponse:
 
     # Store as a dict (not a tuple) so /runs and /runs/{id}/window/{i} can read metadata
     # without loading all the numpy arrays into the response.
+    # pipeline_config is stored so the export system can produce a downloadable JSON.
     store.pipeline_runs[run_id] = {
         "session_id":       request.session_id,
         "name":             request.name,
@@ -121,6 +122,7 @@ async def run_pipeline(request: RunPipelineRequest) -> JSONResponse:
         "n_windows":        len(windows),
         "window_shape":     window_shape,
         "steps_applied":    steps_applied,
+        "pipeline_config":  request.pipeline_config,   # full config for export
         "signal_offset_sec": signal_offset_sec,
         "created_at":       datetime.now(timezone.utc).isoformat(),
     }
