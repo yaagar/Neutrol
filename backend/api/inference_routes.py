@@ -118,8 +118,13 @@ async def stream_run(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "error", "message": f"Job '{job_id}' is not complete (status: {job.get('status')})."})
             return
 
-        # Validate pipeline run exists
-        windows = store.pipeline_runs.get(run_id)
+        # Validate pipeline run exists — store.pipeline_runs holds a dict per run,
+        # the actual window arrays are under the "windows" key
+        run_entry = store.pipeline_runs.get(run_id)
+        if not run_entry:
+            await websocket.send_json({"type": "error", "message": f"Pipeline run '{run_id}' not found."})
+            return
+        windows = run_entry.get("windows", [])
         if not windows:
             await websocket.send_json({"type": "error", "message": f"Pipeline run '{run_id}' not found."})
             return
