@@ -759,12 +759,88 @@ class ICAFilter(PreprocessingStep):
 
 
 # ---------------------------------------------------------------------------
+# TruncateSignal — crop the recording to a time region of interest
+# ---------------------------------------------------------------------------
+
+class TruncateSignal(PreprocessingStep):
+    """
+    Crop the continuous signal to [start_sec, end_sec].
+
+    Why truncate?
+      Many EEG recordings have a "rest" period at the start before the actual
+      task begins, or noisy data at the end. Truncating to the region of interest
+      reduces data size and prevents the model from training on irrelevant signal.
+
+    IMPORTANT: Must be the FIRST step in the pipeline.
+      Truncating shifts the time axis — all subsequent steps and event-label
+      alignment must work with the cropped signal. If placed after filtering,
+      filter edge artifacts may be introduced at the new start boundary.
+
+    signal_offset_sec is stored in the pipeline run metadata and passed to
+    apply_events_to_windows() so event markers (in original-recording time)
+    are correctly mapped to windows (in truncated-signal time).
+    """
+
+    def __init__(self, start_sec: float = 0.0, end_sec: float | None = None) -> None:
+        """
+        Args:
+            start_sec: Seconds from recording start to begin keeping. Default 0.0.
+            end_sec:   Seconds from recording start to stop keeping.
+                       None means keep until the end of the recording.
+        """
+        if start_sec < 0:
+            raise ValueError(f"start_sec must be non-negative, got {start_sec}")
+        if end_sec is not None and end_sec <= start_sec:
+            raise ValueError(
+                f"end_sec ({end_sec}) must be greater than start_sec ({start_sec})"
+            )
+        self.start_sec = start_sec
+        self.end_sec   = end_sec
+
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
+        """Slice the signal to [start_sec, end_sec]."""
+        n_channels, n_samples = signals.shape
+        start_sample = int(self.start_sec * sample_rate)
+        end_sample   = int(self.end_sec * sample_rate) if self.end_sec is not None else n_samples
+        end_sample   = min(end_sample, n_samples)   # clamp to actual signal length
+
+        if start_sample >= n_samples:
+            raise ValueError(
+                f"TruncateSignal: start_sec ({self.start_sec:.1f}s) is at or beyond "
+                f"the signal end ({n_samples / sample_rate:.1f}s)"
+            )
+
+        result = signals[:, start_sample:end_sample]
+        logger.info(
+            "TruncateSignal: kept %.2fs–%.2fs (%d → %d samples)",
+            self.start_sec, end_sample / sample_rate, n_samples, result.shape[1],
+        )
+        return result
+
+    def to_dict(self) -> dict:
+        return {"step": "truncate", "start_sec": self.start_sec, "end_sec": self.end_sec}
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "TruncateSignal":
+        return cls(
+            start_sec=config.get("start_sec", 0.0),
+            end_sec=config.get("end_sec"),
+        )
+
+
+# ---------------------------------------------------------------------------
 # STEP_REGISTRY — maps JSON "step" strings to their classes
 # ---------------------------------------------------------------------------
 
 # This registry is how Pipeline.from_dict() reconstructs a pipeline from saved JSON.
 # If a new step type is added in the future, register it here.
 STEP_REGISTRY: dict[str, type[PreprocessingStep]] = {
+    "truncate":  TruncateSignal,
     "bandpass":  BandpassFilter,
     "notch":     NotchFilter,
     "normalize": Normalize,

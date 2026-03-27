@@ -2,12 +2,15 @@
 //
 // Page flow:
 //   1. Load label summary from the backend → show class distribution
-//   2. User configures the model (learning rate, epochs, batch size)
-//      Classes are auto-detected from the labels
-//   3. User clicks "Start Training" → POST /api/train/start → get job_id
-//   4. Connect WebSocket to /api/train/ws/{job_id}/progress
-//   5. Receive progress messages → update loss/accuracy charts in real time
-//   6. When training finishes → show final accuracy + confusion matrix
+//   2. User selects a pipeline run to train on
+//   3. User configures the model (learning rate, epochs, batch size, layers)
+//   4. User clicks "Start Training" → POST /api/train/start → get job_id
+//   5. Connect WebSocket to /api/train/ws/{job_id}/progress
+//   6. Receive progress messages → update loss/accuracy charts in real time
+//   7. When training finishes → show final accuracy + confusion matrix
+//
+// State is persisted in Zustand (trainPageState) so navigating away and back
+// does not reset the form or wipe the in-progress training results.
 import { useState, useEffect, useRef } from 'react'
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid,
@@ -15,120 +18,103 @@ import {
 } from 'recharts'
 import { useSession } from '../hooks/useSession'
 import ModelLayerEditor from '../components/ModelLayerEditor'
+import useAppStore from '../store/appStore'
 
 import { API_BASE_URL, WS_BASE_URL } from '../config'
 const API    = API_BASE_URL
 const WS_API = WS_BASE_URL
 
-// Default model configuration — matches CLAUDE.md ModelConfig spec
-const DEFAULT_CONFIG = {
-  learning_rate: 0.001,
-  epochs:        50,
-  batch_size:    32,
-}
-
-// Default EEGNet-inspired layer architecture from CLAUDE.md
-const DEFAULT_LAYERS = [
-  { type: 'Conv2d',          out_channels: 16, kernel_size: [1, 32], padding: 'same', activation: 'ELU', batch_norm: true },
-  { type: 'DepthwiseConv2d', depth_multiplier: 2, kernel_size: ['n_channels', 1], activation: 'ELU', batch_norm: true },
-  { type: 'AvgPool2d',       kernel_size: [1, 4] },
-  { type: 'Dropout',         rate: 0.5 },
-  { type: 'Conv2d',          out_channels: 32, kernel_size: [1, 16], padding: 'same', activation: 'ELU', batch_norm: true },
-  { type: 'AvgPool2d',       kernel_size: [1, 8] },
-  { type: 'Dropout',         rate: 0.5 },
-  { type: 'Flatten' },
-  { type: 'Linear',          out_features: 'n_classes' },
-]
-
 export default function TrainPage() {
   const { currentSession } = useSession()
 
-  // --- Label summary ---
-  const [labelSummary, setLabelSummary]   = useState(null)   // {total_labeled, label_counts}
-  const [labelsLoading, setLabelsLoading] = useState(false)
+  // --- Zustand persistent state ---
+  const trainPageState     = useAppStore(s => s.trainPageState)
+  const setTrainPageState  = useAppStore(s => s.setTrainPageState)
 
-  // --- Model config form ---
-  const [config, setConfig]   = useState(DEFAULT_CONFIG)
-  const [layers, setLayers]   = useState(DEFAULT_LAYERS)
+  // Destructure for local convenience — writes go back through setTrainPageState
+  const { config, layers, jobId, status, history, finalResult, selectedRunId, modelName } = trainPageState
 
-  // --- Training state ---
-  const [jobId, setJobId]           = useState(null)
-  const [status, setStatus]         = useState('idle')     // idle | running | done | failed
-  const [history, setHistory]       = useState([])         // [{epoch, train_loss, val_loss, train_acc, val_acc}]
-  const [finalResult, setFinalResult] = useState(null)     // the "done" message from WS
-  const [trainingError, setTrainingError] = useState(null)
-  const [starting, setStarting]     = useState(false)
+  // --- Non-persisted UI state (reset on mount is fine) ---
+  const [labelSummary, setLabelSummary]     = useState(null)
+  const [labelsLoading, setLabelsLoading]   = useState(false)
+  const [trainingError, setTrainingError]   = useState(null)
+  const [starting, setStarting]             = useState(false)
+  const [runs, setRuns]                     = useState([])
+  const [runsLoading, setRunsLoading]       = useState(false)
+  const [renaming, setRenaming]             = useState(false)
+  const [renameInput, setRenameInput]       = useState('')
 
-  // WebSocket ref — we manage it manually here rather than via useWebSocket
-  // because we need fine-grained control over when to connect (after job starts)
+  // WebSocket ref — managed manually for fine-grained connect/disconnect control
   const wsRef = useRef(null)
 
-  // --- Load label summary when session changes ---
+  // --- On session change: reload runs + labels, but keep training state ---
   useEffect(() => {
     if (!currentSession) return
+    fetchRuns()
     fetchLabelSummary()
-    // Reset training state when switching sessions
-    setJobId(null)
-    setStatus('idle')
-    setHistory([])
-    setFinalResult(null)
-    setTrainingError(null)
   }, [currentSession?.session_id])
 
-  // --- Connect WebSocket when a job starts ---
+  // --- Reconnect WebSocket when jobId is set (e.g. after page refresh restores state) ---
   useEffect(() => {
-    if (!jobId) return
+    if (!jobId || status !== 'running') return
 
-    // Close any existing connection first
     if (wsRef.current) wsRef.current.close()
-
     const ws = new WebSocket(`${WS_API}/api/train/ws/${jobId}/progress`)
     wsRef.current = ws
 
     ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data)
-        handleTrainingMessage(msg)
-      } catch {
-        // Ignore non-JSON messages
-      }
+      try { handleTrainingMessage(JSON.parse(event.data)) }
+      catch { /* ignore non-JSON */ }
     }
-
     ws.onerror = () => {
       setTrainingError('WebSocket connection failed. Check the backend is running.')
-      setStatus('failed')
+      setTrainPageState({ status: 'failed' })
     }
-
-    // Cleanup: close socket when component unmounts or jobId changes
     return () => ws.close()
   }, [jobId])
 
   // -------------------------------------------------------------------------
   // Message handler — processes each WebSocket message by type
   // -------------------------------------------------------------------------
-
   function handleTrainingMessage(msg) {
     if (msg.type === 'progress') {
-      // Append one data point to the chart history
-      setHistory(prev => [...prev, {
-        epoch:      msg.epoch,
-        train_loss: msg.train_loss,
-        val_loss:   msg.val_loss,
-        train_acc:  parseFloat((msg.train_acc * 100).toFixed(1)),
-        val_acc:    parseFloat((msg.val_acc   * 100).toFixed(1)),
-      }])
+      setTrainPageState(prev => ({
+        history: [...prev.history, {
+          epoch:      msg.epoch,
+          train_loss: msg.train_loss,
+          val_loss:   msg.val_loss,
+          train_acc:  parseFloat((msg.train_acc * 100).toFixed(1)),
+          val_acc:    parseFloat((msg.val_acc   * 100).toFixed(1)),
+        }],
+      }))
     } else if (msg.type === 'done') {
-      setFinalResult(msg)
-      setStatus('done')
+      setTrainPageState({ finalResult: msg, status: 'done' })
     } else if (msg.type === 'error') {
       setTrainingError(msg.message)
-      setStatus('failed')
+      setTrainPageState({ status: 'failed' })
     }
   }
 
   // -------------------------------------------------------------------------
   // API helpers
   // -------------------------------------------------------------------------
+  async function fetchRuns() {
+    if (!currentSession) return
+    setRunsLoading(true)
+    try {
+      const res  = await fetch(`${API}/api/pipeline/runs`)
+      const json = await res.json()
+      if (json.success) {
+        const sessionRuns = json.data.filter(r => r.session_id === currentSession.session_id)
+        setRuns(sessionRuns)
+        // Auto-select most recent run if none selected
+        if (sessionRuns.length > 0 && !selectedRunId) {
+          setTrainPageState({ selectedRunId: sessionRuns[sessionRuns.length - 1].run_id })
+        }
+      }
+    } catch { /* ignore */ }
+    finally { setRunsLoading(false) }
+  }
 
   async function fetchLabelSummary() {
     if (!currentSession) return
@@ -137,10 +123,13 @@ export default function TrainPage() {
       const res  = await fetch(`${API}/api/labels/${currentSession.session_id}`)
       const json = await res.json()
       if (json.success) {
-        // Build a counts map: {label: count}
+        // Build counts for labels that belong to the selected run
+        const relevantLabels = selectedRunId
+          ? json.data.labels.filter(l => l.run_id === selectedRunId)
+          : json.data.labels
         const counts = {}
-        json.data.labels.forEach(l => { counts[l.label] = (counts[l.label] || 0) + 1 })
-        setLabelSummary({ total: json.data.total_labeled, counts })
+        relevantLabels.forEach(l => { counts[l.label] = (counts[l.label] || 0) + 1 })
+        setLabelSummary({ total: relevantLabels.length, counts })
       }
     } catch {
       setLabelSummary(null)
@@ -154,15 +143,10 @@ export default function TrainPage() {
 
     setStarting(true)
     setTrainingError(null)
-    setHistory([])
-    setFinalResult(null)
-    setStatus('idle')
+    setTrainPageState({ history: [], finalResult: null, status: 'idle' })
 
-    // Auto-detect classes from labels
     const detectedClasses = Object.keys(labelSummary.counts).sort()
-
-    // input_samples = sample_rate × 1s window (default window size)
-    const inputSamples = currentSession.sample_rate * 1
+    const inputSamples    = currentSession.sample_rate * 1
 
     const modelConfig = {
       ...config,
@@ -176,31 +160,54 @@ export default function TrainPage() {
       const res  = await fetch(`${API}/api/train/start`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
+        body: JSON.stringify({
           session_id:      currentSession.session_id,
+          run_id:          selectedRunId || null,
+          model_name:      modelName,
           training_config: modelConfig,
         }),
       })
       const json = await res.json()
       if (json.success) {
-        setJobId(json.data.job_id)
-        setStatus('running')
+        setTrainPageState({ jobId: json.data.job_id, status: 'running' })
       } else {
         setTrainingError(json.error || 'Failed to start training.')
-        setStatus('failed')
+        setTrainPageState({ status: 'failed' })
       }
     } catch {
       setTrainingError('Could not reach the backend. Is it running on port 8000?')
-      setStatus('failed')
+      setTrainPageState({ status: 'failed' })
     } finally {
       setStarting(false)
     }
   }
 
+  async function saveModelName() {
+    if (!jobId) return
+    setRenaming(true)
+    try {
+      const res = await fetch(`${API}/api/train/${jobId}/name`, {
+        method:  'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model_name: renameInput }),
+      })
+      const json = await res.json()
+      if (json.success) {
+        setTrainPageState({ modelName: json.data.model_name })
+        setRenameInput('')
+      }
+    } catch { /* ignore */ }
+    finally { setRenaming(false) }
+  }
+
+  // Refresh label summary when selected run changes
+  useEffect(() => {
+    if (currentSession) fetchLabelSummary()
+  }, [selectedRunId])
+
   // -------------------------------------------------------------------------
   // Guard: no session
   // -------------------------------------------------------------------------
-
   if (!currentSession) {
     return (
       <div className="max-w-xl">
@@ -213,15 +220,13 @@ export default function TrainPage() {
     )
   }
 
-  // Detect the classes auto from labeled data
-  const detectedClasses = labelSummary ? Object.keys(labelSummary.counts).sort() : []
+  const detectedClasses = labelSummary ? Object.keys(labelSummary.counts).filter(l => l !== 'unknown').sort() : []
   const totalEpochs     = config.epochs
   const currentEpoch    = history.length
 
   // -------------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------------
-
   return (
     <div className="max-w-4xl">
       <h1 className="text-2xl font-bold text-gray-100 mb-1">Train</h1>
@@ -231,7 +236,67 @@ export default function TrainPage() {
       </p>
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 1: Label summary                                             */}
+      {/* Section 1: Run selector                                              */}
+      {/* ------------------------------------------------------------------ */}
+      <section className="mb-8">
+        <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
+          Pipeline Run
+        </h2>
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          {runsLoading ? (
+            <p className="text-gray-500 text-sm">Loading runs…</p>
+          ) : runs.length === 0 ? (
+            <div className="bg-yellow-900/20 border border-yellow-700 rounded-lg px-4 py-3 text-sm text-yellow-300">
+              No pipeline runs found.{' '}
+              <a href="/preprocess" className="underline hover:text-yellow-200">Go to Preprocess</a>{' '}
+              and run a pipeline first.
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              <p className="text-xs text-gray-500 mb-1">Select which pipeline run to train on:</p>
+              <div className="flex flex-col gap-1.5">
+                {runs.map(run => (
+                  <label
+                    key={run.run_id}
+                    className={`flex items-center gap-3 cursor-pointer rounded-lg px-3 py-2 border transition ${
+                      selectedRunId === run.run_id
+                        ? 'border-purple-500 bg-purple-900/20'
+                        : 'border-gray-700 bg-gray-800 hover:border-gray-600'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="selectedRun"
+                      value={run.run_id}
+                      checked={selectedRunId === run.run_id}
+                      onChange={() => setTrainPageState({ selectedRunId: run.run_id })}
+                      className="accent-purple-500"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-gray-200 font-medium">
+                        {run.name || <span className="text-gray-500 italic">Unnamed run</span>}
+                        <span className="ml-2 text-xs text-gray-500 font-normal">{run.run_id.slice(0, 8)}</span>
+                      </p>
+                      <p className="text-xs text-gray-400">
+                        {run.n_windows} windows · {run.steps_applied?.join(' → ')}
+                      </p>
+                    </div>
+                  </label>
+                ))}
+              </div>
+              <button
+                onClick={fetchRuns}
+                className="text-xs text-gray-600 hover:text-gray-400 transition-colors self-start mt-1"
+              >
+                Refresh
+              </button>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Section 2: Label summary                                             */}
       {/* ------------------------------------------------------------------ */}
       <section className="mb-8">
         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
@@ -242,7 +307,7 @@ export default function TrainPage() {
           <p className="text-gray-500 text-sm">Loading labels…</p>
         ) : !labelSummary || labelSummary.total === 0 ? (
           <div className="bg-yellow-900/20 border border-yellow-700 rounded-lg px-4 py-3 text-sm text-yellow-300">
-            No labeled windows found for this session.{' '}
+            No labeled windows found for this run.{' '}
             <a href="/label" className="underline hover:text-yellow-200">Go to Label</a>{' '}
             and label some windows first.
           </div>
@@ -250,8 +315,12 @@ export default function TrainPage() {
           <div className="flex flex-wrap gap-3 items-center">
             <span className="text-gray-400 text-sm">{labelSummary.total} total windows</span>
             {Object.entries(labelSummary.counts).map(([label, count]) => (
-              <span key={label} className="bg-gray-800 border border-gray-700 text-gray-300 text-xs px-3 py-1 rounded-full">
-                {count}× <span className="text-purple-300 font-medium">{label}</span>
+              <span key={label} className={`border text-xs px-3 py-1 rounded-full ${
+                label === 'unknown'
+                  ? 'bg-gray-800 border-gray-600 text-gray-500'
+                  : 'bg-gray-800 border-gray-700 text-gray-300'
+              }`}>
+                {count}× <span className={label === 'unknown' ? 'text-gray-500' : 'text-purple-300 font-medium'}>{label}</span>
               </span>
             ))}
             <button
@@ -265,7 +334,7 @@ export default function TrainPage() {
       </section>
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 2: Model configuration                                       */}
+      {/* Section 3: Model configuration                                       */}
       {/* ------------------------------------------------------------------ */}
       <section className="mb-8">
         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
@@ -273,9 +342,22 @@ export default function TrainPage() {
         </h2>
 
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+          {/* Model name */}
+          <div className="mb-4">
+            <p className="text-xs text-gray-500 mb-1">Model Name (optional)</p>
+            <input
+              type="text"
+              placeholder="e.g. Motor Imagery v1"
+              value={modelName}
+              onChange={e => setTrainPageState({ modelName: e.target.value })}
+              disabled={status === 'running'}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+            />
+          </div>
+
           {/* Auto-detected classes */}
           <div className="mb-4">
-            <p className="text-xs text-gray-500 mb-1">Classes (auto-detected from labels)</p>
+            <p className="text-xs text-gray-500 mb-1">Classes (auto-detected from labels — excludes 'unknown')</p>
             {detectedClasses.length > 0 ? (
               <div className="flex gap-2 flex-wrap">
                 {detectedClasses.map(c => (
@@ -294,12 +376,12 @@ export default function TrainPage() {
             <p className="text-xs text-gray-500 mb-3">
               Layer Architecture
               <span className="ml-2 text-gray-600">
-                — drag cards up/down to reorder, click × to delete
+                — click × to delete, use ▲▼ to reorder
               </span>
             </p>
             <ModelLayerEditor
               layers={layers}
-              onChange={setLayers}
+              onChange={(newLayers) => setTrainPageState({ layers: newLayers })}
               inputChannels={currentSession.n_channels}
               inputSamples={currentSession.sample_rate * 1}
               classes={detectedClasses}
@@ -312,7 +394,7 @@ export default function TrainPage() {
               <input
                 type="number" step="0.0001" min="0.00001" max="0.1"
                 value={config.learning_rate}
-                onChange={e => setConfig(c => ({ ...c, learning_rate: parseFloat(e.target.value) }))}
+                onChange={e => setTrainPageState({ config: { ...config, learning_rate: parseFloat(e.target.value) } })}
                 disabled={status === 'running'}
                 className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
               />
@@ -322,7 +404,7 @@ export default function TrainPage() {
               <input
                 type="number" step="1" min="1" max="500"
                 value={config.epochs}
-                onChange={e => setConfig(c => ({ ...c, epochs: parseInt(e.target.value) }))}
+                onChange={e => setTrainPageState({ config: { ...config, epochs: parseInt(e.target.value) } })}
                 disabled={status === 'running'}
                 className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
               />
@@ -332,7 +414,7 @@ export default function TrainPage() {
               <input
                 type="number" step="1" min="1" max="256"
                 value={config.batch_size}
-                onChange={e => setConfig(c => ({ ...c, batch_size: parseInt(e.target.value) }))}
+                onChange={e => setTrainPageState({ config: { ...config, batch_size: parseInt(e.target.value) } })}
                 disabled={status === 'running'}
                 className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
               />
@@ -365,7 +447,7 @@ export default function TrainPage() {
       )}
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 3: Live training progress                                    */}
+      {/* Section 4: Live training progress                                    */}
       {/* ------------------------------------------------------------------ */}
       {(status === 'running' || history.length > 0) && (
         <section className="mb-8">
@@ -376,7 +458,6 @@ export default function TrainPage() {
             <div className="flex items-center gap-2">
               {status === 'running' && (
                 <>
-                  {/* Animated pulse dot to show it's live */}
                   <span className="relative flex h-2 w-2">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
                     <span className="relative inline-flex rounded-full h-2 w-2 bg-purple-500"></span>
@@ -395,7 +476,6 @@ export default function TrainPage() {
             </div>
           </div>
 
-          {/* Epoch progress bar */}
           {status === 'running' && (
             <div className="mb-4">
               <div className="h-1 bg-gray-800 rounded-full overflow-hidden">
@@ -407,7 +487,6 @@ export default function TrainPage() {
             </div>
           )}
 
-          {/* Loss chart */}
           {history.length > 0 && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 mb-4">
               <p className="text-xs text-gray-500 mb-3">Loss</p>
@@ -418,7 +497,6 @@ export default function TrainPage() {
                   <YAxis stroke="#6b7280" tick={{ fontSize: 11 }} />
                   <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 12 }} />
                   <Legend wrapperStyle={{ fontSize: 12 }} />
-                  {/* Train loss in red, val loss in orange — conventional colour scheme */}
                   <Line type="monotone" dataKey="train_loss" name="Train Loss" stroke="#f87171" dot={false} strokeWidth={2} />
                   <Line type="monotone" dataKey="val_loss"   name="Val Loss"   stroke="#fb923c" dot={false} strokeWidth={2} />
                 </LineChart>
@@ -426,7 +504,6 @@ export default function TrainPage() {
             </div>
           )}
 
-          {/* Accuracy chart */}
           {history.length > 0 && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
               <p className="text-xs text-gray-500 mb-3">Accuracy (%)</p>
@@ -437,7 +514,6 @@ export default function TrainPage() {
                   <YAxis stroke="#6b7280" tick={{ fontSize: 11 }} domain={[0, 100]} />
                   <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 12 }} formatter={(v) => `${v}%`} />
                   <Legend wrapperStyle={{ fontSize: 12 }} />
-                  {/* Train acc in green, val acc in blue */}
                   <Line type="monotone" dataKey="train_acc" name="Train Acc" stroke="#4ade80" dot={false} strokeWidth={2} />
                   <Line type="monotone" dataKey="val_acc"   name="Val Acc"   stroke="#60a5fa" dot={false} strokeWidth={2} />
                 </LineChart>
@@ -448,7 +524,7 @@ export default function TrainPage() {
       )}
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 4: Final results + confusion matrix                          */}
+      {/* Section 5: Final results + confusion matrix                          */}
       {/* ------------------------------------------------------------------ */}
       {status === 'done' && finalResult && (
         <section>
@@ -456,7 +532,29 @@ export default function TrainPage() {
             Results
           </h2>
 
-          {/* Summary cards */}
+          {/* Rename model after training */}
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 mb-5 flex items-center gap-3">
+            <span className="text-xs text-gray-400 flex-shrink-0">Model name:</span>
+            <input
+              type="text"
+              placeholder="Give this model a name…"
+              value={renameInput}
+              onChange={e => setRenameInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && saveModelName()}
+              className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-1 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-purple-500"
+            />
+            <button
+              onClick={saveModelName}
+              disabled={renaming || !renameInput.trim()}
+              className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-gray-200 text-xs px-3 py-1 rounded transition"
+            >
+              {renaming ? 'Saving…' : 'Save'}
+            </button>
+            {modelName && (
+              <span className="text-xs text-purple-400 flex-shrink-0">✓ "{modelName}"</span>
+            )}
+          </div>
+
           <div className="grid grid-cols-2 gap-4 mb-6">
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
               <p className="text-xs text-gray-500 mb-1">Final Val Accuracy</p>
@@ -472,12 +570,10 @@ export default function TrainPage() {
             </div>
           </div>
 
-          {/* Confusion matrix */}
           {finalResult.confusion_matrix && finalResult.class_names && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
               <p className="text-xs text-gray-500 mb-1">Confusion Matrix</p>
               <p className="text-xs text-gray-600 mb-4">Rows = true class, Columns = predicted class</p>
-
               <ConfusionMatrix
                 matrix={finalResult.confusion_matrix}
                 classNames={finalResult.class_names}
@@ -499,12 +595,8 @@ export default function TrainPage() {
 
 // ---------------------------------------------------------------------------
 // ConfusionMatrix — renders an n×n table with heat-coloured cells
-// Props:
-//   matrix     {number[][]} — n_classes × n_classes count matrix
-//   classNames {string[]}   — class name for each row/column
 // ---------------------------------------------------------------------------
 function ConfusionMatrix({ matrix, classNames }) {
-  // Find the maximum value to normalise cell colour intensity
   const maxVal = Math.max(...matrix.flat(), 1)
 
   return (
@@ -512,32 +604,25 @@ function ConfusionMatrix({ matrix, classNames }) {
       <table className="text-xs border-collapse">
         <thead>
           <tr>
-            {/* Top-left empty cell */}
             <th className="px-2 py-1 text-gray-600 font-normal text-right">True ↓ / Pred →</th>
             {classNames.map(name => (
-              <th key={name} className="px-3 py-1 text-gray-400 font-medium text-center">
-                {name}
-              </th>
+              <th key={name} className="px-3 py-1 text-gray-400 font-medium text-center">{name}</th>
             ))}
           </tr>
         </thead>
         <tbody>
           {matrix.map((row, rowIdx) => (
             <tr key={rowIdx}>
-              {/* Row label */}
               <td className="px-2 py-1 text-gray-400 font-medium text-right pr-3">
                 {classNames[rowIdx]}
               </td>
               {row.map((count, colIdx) => {
-                // Diagonal cells (correct predictions) are green-tinted;
-                // off-diagonal (errors) are red-tinted.
-                // Opacity scales with the cell value relative to the max.
                 const intensity = count / maxVal
                 const isCorrect = rowIdx === colIdx
                 const bg = isCorrect
-                  ? `rgba(74, 222, 128, ${0.1 + intensity * 0.7})`   // green for correct
+                  ? `rgba(74, 222, 128, ${0.1 + intensity * 0.7})`
                   : count > 0
-                    ? `rgba(248, 113, 113, ${0.1 + intensity * 0.7})` // red for errors
+                    ? `rgba(248, 113, 113, ${0.1 + intensity * 0.7})`
                     : 'transparent'
                 return (
                   <td

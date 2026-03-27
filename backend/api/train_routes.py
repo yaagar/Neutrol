@@ -60,8 +60,15 @@ def api_response(success: bool, data=None, error: str | None = None) -> dict:
 
 class StartTrainingRequest(BaseModel):
     """Body for POST /api/train/start."""
-    session_id:     str
-    training_config: dict  # ModelConfig JSON dict from CLAUDE.md
+    session_id:      str
+    training_config: dict        # ModelConfig JSON dict from CLAUDE.md
+    run_id:          str | None = None  # Which pipeline run to train on (keyed in labeled_data)
+    model_name:      str = ""    # Optional human-readable name for this trained model
+
+
+class RenameModelRequest(BaseModel):
+    """Body for PATCH /api/train/{job_id}/name."""
+    model_name: str
 
 
 class ValidateConfigRequest(BaseModel):
@@ -89,6 +96,7 @@ async def list_jobs() -> JSONResponse:
         jobs.append({
             "job_id":         job_id,
             "session_id":     job.get("session_id"),
+            "model_name":     job.get("model_name", ""),
             "status":         job.get("status"),
             "started_at":     job.get("started_at"),
             "final_val_acc":  final.get("val_acc"),
@@ -187,8 +195,18 @@ async def start_training(request: StartTrainingRequest) -> JSONResponse:
             content=api_response(False, error=f"Session '{request.session_id}' not found."),
         )
 
-    # Validate labeled data exists
-    labeled_windows = store.labeled_data.get(request.session_id, [])
+    # Validate labeled data exists.
+    # If run_id is provided, look up labeled_data by run_id (preferred — specific run).
+    # Otherwise aggregate all labeled windows for the session (fallback for older clients).
+    if request.run_id:
+        labeled_windows = store.labeled_data.get(request.run_id, [])
+    else:
+        labeled_windows = []
+        for lw_list in store.labeled_data.values():
+            for lw in lw_list:
+                if lw.session_id == request.session_id:
+                    labeled_windows.append(lw)
+
     if len(labeled_windows) == 0:
         return JSONResponse(
             status_code=400,
@@ -223,6 +241,8 @@ async def start_training(request: StartTrainingRequest) -> JSONResponse:
     store.training_jobs[job_id] = {
         "job_id":        job_id,
         "session_id":    request.session_id,
+        "run_id":        request.run_id,
+        "model_name":    request.model_name,
         "model_config":  model_config,
         "status":        "running",
         "current_epoch": 0,
@@ -331,6 +351,34 @@ async def get_training_results(job_id: str) -> JSONResponse:
             "model_path":       job.get("model_path"),
             "model_config":     job["model_config"],
         }),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/train/{job_id}/name — rename a trained model
+# ---------------------------------------------------------------------------
+
+@router.patch("/{job_id}/name")
+async def rename_model(job_id: str, request: RenameModelRequest) -> JSONResponse:
+    """
+    Update the human-readable name for a training job / saved model.
+
+    This lets the user give their models memorable names (e.g. "Motor Imagery v2")
+    instead of the opaque UUID that appears in the Inference page dropdown.
+    """
+    job = store.training_jobs.get(job_id)
+    if job is None:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error=f"Training job '{job_id}' not found."),
+        )
+
+    job["model_name"] = request.model_name.strip()
+    logger.info("Renamed model %s → '%s'", job_id, job["model_name"])
+
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={"job_id": job_id, "model_name": job["model_name"]}),
     )
 
 

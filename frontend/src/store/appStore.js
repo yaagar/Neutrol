@@ -63,6 +63,53 @@ const useAppStore = create((set) => ({
 
   // Update the active training job (called repeatedly as WebSocket progress comes in).
   setTrainingJob: (job) => set({ trainingJob: job }),
+
+  // ---------------------------------------------------------------------------
+  // trainPageState — persists TrainPage UI state across tab navigation
+  // ---------------------------------------------------------------------------
+  trainPageState: {
+    config:      { learning_rate: 0.001, epochs: 50, batch_size: 32 },
+    layers: [
+      { type: 'Conv2d',          out_channels: 16, kernel_size: [1, 32], padding: 'same', activation: 'ELU', batch_norm: true },
+      { type: 'DepthwiseConv2d', depth_multiplier: 2, kernel_size: ['n_channels', 1], activation: 'ELU', batch_norm: true },
+      { type: 'AvgPool2d',       kernel_size: [1, 4] },
+      { type: 'Dropout',         rate: 0.5 },
+      { type: 'Conv2d',          out_channels: 32, kernel_size: [1, 16], padding: 'same', activation: 'ELU', batch_norm: true },
+      { type: 'AvgPool2d',       kernel_size: [1, 8] },
+      { type: 'Dropout',         rate: 0.5 },
+      { type: 'Flatten' },
+      { type: 'Linear',          out_features: 'n_classes' },
+    ],
+    jobId:        null,
+    status:       'idle',   // idle | running | done | failed
+    history:      [],
+    finalResult:  null,
+    selectedRunId: null,
+    modelName:    '',
+  },
+
+  // Merge a partial object into trainPageState (like setState in class components)
+  setTrainPageState: (patch) =>
+    set((state) => ({ trainPageState: { ...state.trainPageState, ...patch } })),
+
+  // ---------------------------------------------------------------------------
+  // preprocessPageState — persists PreprocessPage UI state across tab navigation
+  // ---------------------------------------------------------------------------
+  preprocessPageState: {
+    pipelineSteps: [
+      { step: 'bandpass', low_hz: 1.0, high_hz: 40.0 },
+      { step: 'notch', freq_hz: 60.0, quality_factor: 30.0 },
+      { step: 'normalize', method: 'zscore' },
+      { step: 'window', window_sec: 1.0, overlap_ratio: 0.5 },
+    ],
+    activeTab:   'time',
+    activeRunId: null,
+    runName:     '',
+  },
+
+  // Merge a partial object into preprocessPageState
+  setPreprocessPageState: (patch) =>
+    set((state) => ({ preprocessPageState: { ...state.preprocessPageState, ...patch } })),
 }))
 
 export default useAppStore

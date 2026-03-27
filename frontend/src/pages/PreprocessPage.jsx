@@ -4,9 +4,13 @@
 //   Left:  Pipeline builder — add/remove/configure steps, run pipeline
 //   Right: Signal analysis tabs — Time, Frequency, Band Power, Spectrogram
 //          with a Before/After toggle comparing raw vs preprocessed signal
+//
+// Pipeline step state (pipelineSteps, activeTab, activeRunId) is persisted
+// in Zustand so navigating away and back doesn't reset the pipeline config.
 
 import { useState, useEffect, useCallback } from 'react'
 import { useSession } from '../hooks/useSession'
+import useAppStore from '../store/appStore'
 import WaveformChart from '../components/WaveformChart'
 import FrequencyChart from '../components/FrequencyChart'
 import BandPowerChart from '../components/BandPowerChart'
@@ -20,6 +24,14 @@ const API = API_BASE_URL
 // used when the step is first added.
 const STEP_PRESETS = [
   {
+    label: 'Truncate Signal',
+    config: { step: 'truncate', start_sec: 0.0, end_sec: null },
+    fields: [
+      { key: 'start_sec', label: 'Start (s)', type: 'number', min: 0,   step: 1 },
+      { key: 'end_sec',   label: 'End (s)',   type: 'number', min: 0.1, step: 1 },
+    ],
+  },
+  {
     label: 'Bandpass Filter',
     config: { step: 'bandpass', low_hz: 1.0, high_hz: 40.0 },
     fields: [
@@ -31,9 +43,15 @@ const STEP_PRESETS = [
     label: 'Notch Filter',
     config: { step: 'notch', freq_hz: 60.0, quality_factor: 30.0 },
     fields: [
-      { key: 'freq_hz',        label: 'Freq (Hz)', type: 'number', min: 1,   step: 1   },
-      { key: 'quality_factor', label: 'Q factor',  type: 'number', min: 1,   step: 1   },
+      { key: 'freq_hz',        label: 'Freq (Hz)', type: 'number', min: 1, step: 1 },
+      { key: 'quality_factor', label: 'Q factor',  type: 'number', min: 1, step: 1 },
     ],
+  },
+  {
+    label: 'Channel Selector',
+    // channels is a list — rendered as checkboxes using session.channel_names
+    config: { step: 'channels', channels: [] },
+    fields: [],  // no regular fields — handled specially in render
   },
   {
     label: 'Re-reference',
@@ -67,43 +85,38 @@ const STEP_PRESETS = [
 ]
 
 const ANALYSIS_TABS = [
-  { id: 'time',      label: 'Time' },
-  { id: 'frequency', label: 'Frequency' },
-  { id: 'bandpower', label: 'Band Power' },
+  { id: 'time',        label: 'Time' },
+  { id: 'frequency',   label: 'Frequency' },
+  { id: 'bandpower',   label: 'Band Power' },
   { id: 'spectrogram', label: 'Spectrogram' },
 ]
 
 export default function PreprocessPage() {
   const { currentSession } = useSession()
 
-  // --- Pipeline state ---
-  const [pipelineSteps, setPipelineSteps] = useState([
-    { step: 'bandpass', low_hz: 1.0, high_hz: 40.0 },
-    { step: 'notch', freq_hz: 60.0, quality_factor: 30.0 },
-    { step: 'normalize', method: 'zscore' },
-    { step: 'window', window_sec: 1.0, overlap_ratio: 0.5 },
-  ])
+  // --- Zustand persistent state ---
+  const preprocessPageState    = useAppStore(s => s.preprocessPageState)
+  const setPreprocessPageState = useAppStore(s => s.setPreprocessPageState)
+  const { pipelineSteps, activeTab, activeRunId, runName } = preprocessPageState
+
+  // --- Local UI state (not worth persisting) ---
   const [selectedPreset, setSelectedPreset] = useState('')
-  const [running, setRunning] = useState(false)
-  const [runResult, setRunResult] = useState(null)
-  const [runError, setRunError] = useState(null)
+  const [running, setRunning]               = useState(false)
+  const [runResult, setRunResult]           = useState(null)
+  const [runError, setRunError]             = useState(null)
+  const [runs, setRuns]                     = useState([])
 
-  // Existing pipeline runs for this session
-  const [runs, setRuns] = useState([])
-  const [activeRunId, setActiveRunId] = useState(null)
-
-  // --- Analysis state ---
-  const [activeTab, setActiveTab] = useState('time')
-  const [showRaw, setShowRaw] = useState(true)   // before/after toggle
+  // Before/after toggle and channel selector (local)
+  const [showRaw, setShowRaw]               = useState(true)
   const [selectedChannel, setSelectedChannel] = useState(0)
 
-  // Loaded analysis data
-  const [waveformData, setWaveformData] = useState(null)
-  const [psdData, setPsdData]           = useState(null)
-  const [bandData, setBandData]         = useState(null)
-  const [spectrogramData, setSpectrogramData] = useState(null)
-  const [analysisLoading, setAnalysisLoading] = useState(false)
-  const [analysisError, setAnalysisError]     = useState(null)
+  // Analysis data
+  const [waveformData, setWaveformData]         = useState(null)
+  const [psdData, setPsdData]                   = useState(null)
+  const [bandData, setBandData]                 = useState(null)
+  const [spectrogramData, setSpectrogramData]   = useState(null)
+  const [analysisLoading, setAnalysisLoading]   = useState(false)
+  const [analysisError, setAnalysisError]       = useState(null)
 
   // -------------------------------------------------------------------------
   // Load existing runs when session changes
@@ -111,7 +124,6 @@ export default function PreprocessPage() {
   useEffect(() => {
     if (!currentSession) {
       setRuns([])
-      setActiveRunId(null)
       setRunResult(null)
       setPsdData(null)
       setBandData(null)
@@ -126,14 +138,14 @@ export default function PreprocessPage() {
   async function fetchRuns() {
     if (!currentSession) return
     try {
-      const res = await fetch(`${API}/api/pipeline/runs`)
+      const res  = await fetch(`${API}/api/pipeline/runs`)
       const json = await res.json()
       if (json.success) {
         const sessionRuns = json.data.filter(r => r.session_id === currentSession.session_id)
         setRuns(sessionRuns)
-        // Auto-select most recent run
+        // Auto-select most recent run if none selected
         if (sessionRuns.length > 0 && !activeRunId) {
-          setActiveRunId(sessionRuns[sessionRuns.length - 1].run_id)
+          setPreprocessPageState({ activeRunId: sessionRuns[sessionRuns.length - 1].run_id })
         }
       }
     } catch (err) {
@@ -144,7 +156,7 @@ export default function PreprocessPage() {
   async function loadWaveform() {
     if (!currentSession) return
     try {
-      const res = await fetch(`${API}/api/data/${currentSession.session_id}/preview?max_samples=512`)
+      const res  = await fetch(`${API}/api/data/${currentSession.session_id}/preview?max_samples=512`)
       const json = await res.json()
       if (json.success) setWaveformData(json.data)
     } catch (err) {
@@ -162,19 +174,24 @@ export default function PreprocessPage() {
     setRunResult(null)
 
     try {
-      const res = await fetch(`${API}/api/pipeline/run`, {
-        method: 'POST',
+      const res  = await fetch(`${API}/api/pipeline/run`, {
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          session_id: currentSession.session_id,
+          session_id:      currentSession.session_id,
           pipeline_config: { steps: pipelineSteps },
+          name:            runName,
         }),
       })
       const json = await res.json()
       if (json.success) {
         setRunResult(json.data)
-        setActiveRunId(json.data.run_id)
+        setPreprocessPageState({ activeRunId: json.data.run_id })
         await fetchRuns()
+        // Clear analysis cache so After view reflects new run
+        setPsdData(null)
+        setBandData(null)
+        setSpectrogramData(null)
       } else {
         setRunError(json.error || 'Pipeline run failed.')
       }
@@ -197,8 +214,8 @@ export default function PreprocessPage() {
         session_id: currentSession.session_id,
         run_id: showRaw ? null : (activeRunId || null),
       }
-      const res = await fetch(`${API}/api/analysis/psd`, {
-        method: 'POST',
+      const res  = await fetch(`${API}/api/analysis/psd`, {
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
@@ -221,8 +238,8 @@ export default function PreprocessPage() {
         session_id: currentSession.session_id,
         run_id: showRaw ? null : (activeRunId || null),
       }
-      const res = await fetch(`${API}/api/analysis/bandpower`, {
-        method: 'POST',
+      const res  = await fetch(`${API}/api/analysis/bandpower`, {
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
@@ -242,12 +259,12 @@ export default function PreprocessPage() {
     setAnalysisError(null)
     try {
       const body = {
-        session_id: currentSession.session_id,
-        run_id: showRaw ? null : (activeRunId || null),
+        session_id:    currentSession.session_id,
+        run_id:        showRaw ? null : (activeRunId || null),
         channel_index: selectedChannel,
       }
-      const res = await fetch(`${API}/api/analysis/spectrogram`, {
-        method: 'POST',
+      const res  = await fetch(`${API}/api/analysis/spectrogram`, {
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
@@ -289,21 +306,35 @@ export default function PreprocessPage() {
     if (!selectedPreset) return
     const preset = STEP_PRESETS.find(p => p.label === selectedPreset)
     if (!preset) return
-    setPipelineSteps(prev => [...prev, { ...preset.config }])
+    const newConfig = { ...preset.config }
+    // For Channel Selector: pre-populate with all current session channels
+    if (newConfig.step === 'channels' && currentSession) {
+      newConfig.channels = [...(currentSession.channel_names || [])]
+    }
+    setPreprocessPageState({ pipelineSteps: [...pipelineSteps, newConfig] })
     setSelectedPreset('')
   }
 
   function removeStep(idx) {
-    setPipelineSteps(prev => prev.filter((_, i) => i !== idx))
+    setPreprocessPageState({ pipelineSteps: pipelineSteps.filter((_, i) => i !== idx) })
   }
 
   function updateStepField(idx, key, value) {
-    setPipelineSteps(prev => {
-      const updated = [...prev]
-      const numVal = parseFloat(value)
-      updated[idx] = { ...updated[idx], [key]: isNaN(numVal) ? value : numVal }
-      return updated
-    })
+    const updated = [...pipelineSteps]
+    const numVal  = parseFloat(value)
+    updated[idx]  = { ...updated[idx], [key]: isNaN(numVal) ? value : numVal }
+    setPreprocessPageState({ pipelineSteps: updated })
+  }
+
+  // Toggle a channel on/off for ChannelSelector steps
+  function toggleChannel(idx, channelName) {
+    const updated  = [...pipelineSteps]
+    const current  = updated[idx].channels || []
+    const newChans = current.includes(channelName)
+      ? current.filter(c => c !== channelName)
+      : [...current, channelName]
+    updated[idx] = { ...updated[idx], channels: newChans }
+    setPreprocessPageState({ pipelineSteps: updated })
   }
 
   function getStepPreset(stepConfig) {
@@ -323,7 +354,7 @@ export default function PreprocessPage() {
   }
 
   const channelNames = currentSession.channel_names || []
-  const hasRun = runs.length > 0
+  const hasRun       = runs.length > 0
 
   // -------------------------------------------------------------------------
   // Render
@@ -338,7 +369,7 @@ export default function PreprocessPage() {
         {/* Session info */}
         <div className="bg-gray-800 rounded-lg p-3">
           <p className="text-xs font-semibold text-gray-400 uppercase mb-1">Session</p>
-          <p className="text-sm text-gray-200 truncate">{currentSession.session_id.slice(0, 8)}...</p>
+          <p className="text-sm text-gray-200 truncate">{currentSession.session_id.slice(0, 8)}…</p>
           <p className="text-xs text-gray-400">
             {currentSession.n_channels} ch · {currentSession.sample_rate} Hz · {currentSession.duration_seconds?.toFixed(1)}s
           </p>
@@ -369,7 +400,8 @@ export default function PreprocessPage() {
                       ✕
                     </button>
                   </div>
-                  {/* Step fields */}
+
+                  {/* Regular fields */}
                   {preset?.fields.map(field => (
                     <div key={field.key} className="flex items-center gap-2 mb-1">
                       <label className="text-xs text-gray-400 w-24 flex-shrink-0">{field.label}</label>
@@ -396,6 +428,34 @@ export default function PreprocessPage() {
                       )}
                     </div>
                   ))}
+
+                  {/* Channel Selector — visual checkbox list */}
+                  {stepConfig.step === 'channels' && (
+                    <div className="mt-1">
+                      <p className="text-xs text-gray-400 mb-1">Channels to keep:</p>
+                      <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto">
+                        {channelNames.map(ch => {
+                          const isSelected = (stepConfig.channels || []).includes(ch)
+                          return (
+                            <button
+                              key={ch}
+                              onClick={() => toggleChannel(idx, ch)}
+                              className={`text-xs px-1.5 py-0.5 rounded border transition ${
+                                isSelected
+                                  ? 'bg-blue-600 border-blue-500 text-white'
+                                  : 'bg-gray-600 border-gray-500 text-gray-300 hover:bg-gray-500'
+                              }`}
+                            >
+                              {ch}
+                            </button>
+                          )
+                        })}
+                      </div>
+                      <p className="text-xs text-gray-500 mt-1">
+                        {(stepConfig.channels || []).length}/{channelNames.length} selected
+                      </p>
+                    </div>
+                  )}
                 </div>
               )
             })}
@@ -408,7 +468,7 @@ export default function PreprocessPage() {
               onChange={e => setSelectedPreset(e.target.value)}
               className="flex-1 bg-gray-600 text-gray-200 text-xs rounded px-1 py-1"
             >
-              <option value="">+ Add step...</option>
+              <option value="">+ Add step…</option>
               {STEP_PRESETS.map(p => (
                 <option key={p.label} value={p.label}>{p.label}</option>
               ))}
@@ -421,6 +481,18 @@ export default function PreprocessPage() {
               Add
             </button>
           </div>
+        </div>
+
+        {/* Run name input */}
+        <div className="bg-gray-800 rounded-lg p-3">
+          <p className="text-xs font-semibold text-gray-400 uppercase mb-1">Run Name</p>
+          <input
+            type="text"
+            placeholder="e.g. Bandpass + Window 1s"
+            value={runName}
+            onChange={e => setPreprocessPageState({ runName: e.target.value })}
+            className="w-full bg-gray-700 border border-gray-600 text-gray-200 text-xs rounded px-2 py-1 focus:outline-none focus:border-blue-500 placeholder-gray-500"
+          />
         </div>
 
         {/* Run pipeline button */}
@@ -438,6 +510,7 @@ export default function PreprocessPage() {
         {runResult && (
           <p className="text-green-400 text-xs bg-green-900/20 rounded p-2">
             ✓ {runResult.n_windows} windows ({runResult.window_shape?.join('×')})
+            {runResult.name && <span className="ml-1 text-green-300">"{runResult.name}"</span>}
           </p>
         )}
 
@@ -449,14 +522,19 @@ export default function PreprocessPage() {
               {runs.map(run => (
                 <button
                   key={run.run_id}
-                  onClick={() => setActiveRunId(run.run_id)}
+                  onClick={() => setPreprocessPageState({ activeRunId: run.run_id })}
                   className={`text-left text-xs rounded p-1.5 transition ${
                     activeRunId === run.run_id
                       ? 'bg-blue-600 text-white'
                       : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                   }`}
                 >
-                  {run.n_windows} windows · {run.steps_applied?.join('→')}
+                  <span className="font-medium">
+                    {run.name || <span className="italic text-gray-400">Unnamed</span>}
+                  </span>
+                  <span className="ml-1 opacity-60">{run.run_id.slice(0, 6)}</span>
+                  <br />
+                  <span className="opacity-70">{run.n_windows} windows · {run.steps_applied?.join('→')}</span>
                 </button>
               ))}
             </div>
@@ -476,7 +554,7 @@ export default function PreprocessPage() {
             {ANALYSIS_TABS.map(tab => (
               <button
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => setPreprocessPageState({ activeTab: tab.id })}
                 className={`px-3 py-1 rounded text-sm font-medium transition ${
                   activeTab === tab.id
                     ? 'bg-blue-600 text-white'
@@ -530,8 +608,8 @@ export default function PreprocessPage() {
           {activeTab !== 'time' && (
             <button
               onClick={() => {
-                if (activeTab === 'frequency') fetchPsd()
-                if (activeTab === 'bandpower') fetchBandPower()
+                if (activeTab === 'frequency')   fetchPsd()
+                if (activeTab === 'bandpower')   fetchBandPower()
                 if (activeTab === 'spectrogram') fetchSpectrogram()
               }}
               disabled={analysisLoading}
@@ -617,7 +695,7 @@ export default function PreprocessPage() {
           {showRaw
             ? 'Showing raw signal'
             : activeRunId
-              ? `Showing preprocessed — run ${activeRunId.slice(0, 8)}`
+              ? `Showing preprocessed — run ${runs.find(r => r.run_id === activeRunId)?.name || activeRunId.slice(0, 8)}`
               : 'No preprocessed run selected'}
         </p>
       </div>

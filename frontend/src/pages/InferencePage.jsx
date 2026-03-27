@@ -221,14 +221,22 @@ export default function InferencePage() {
               >
                 {jobs.map(j => (
                   <option key={j.job_id} value={j.job_id}>
-                    {j.classes?.join(' / ')} — {j.final_val_acc != null ? `${(j.final_val_acc * 100).toFixed(1)}% val` : 'no metrics'}
+                    {j.model_name
+                      ? `${j.model_name} (${j.classes?.join('/')})`
+                      : j.classes?.join(' / ')
+                    }{' '}
+                    — {j.final_val_acc != null ? `${(j.final_val_acc * 100).toFixed(1)}% val` : 'no metrics'}
                   </option>
                 ))}
               </select>
             )}
             {selectedJobInfo && (
               <p className="text-xs text-gray-600 mt-1 font-mono truncate">
-                {selectedJobInfo.job_id.slice(0, 16)}…
+                {selectedJobInfo.model_name
+                  ? <span className="text-purple-500 not-italic">{selectedJobInfo.model_name}</span>
+                  : null
+                }
+                {' '}{selectedJobInfo.job_id.slice(0, 16)}…
               </p>
             )}
           </div>
@@ -254,7 +262,10 @@ export default function InferencePage() {
               >
                 {runs.map(r => (
                   <option key={r.run_id} value={r.run_id}>
-                    {r.n_windows} windows — {r.created_at?.slice(0, 10)}
+                    {r.name
+                      ? `${r.name} — ${r.n_windows} windows`
+                      : `${r.n_windows} windows — ${r.created_at?.slice(0, 10)}`
+                    }
                   </option>
                 ))}
               </select>

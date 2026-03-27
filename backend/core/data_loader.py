@@ -99,6 +99,7 @@ class LabeledWindow:
     label: str              # e.g. "rest", "left", "right", "blink"
     start_time_sec: float   # Where in the original recording this window starts
     session_id: str         # Which session this came from
+    run_id: str = ""        # Which pipeline run this window came from
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +603,9 @@ def apply_events_to_windows(
     sample_rate: int,
     window_sec: float,
     session_id: str = "",
+    run_id: str = "",
     step_samples: int | None = None,
+    signal_offset_sec: float = 0.0,
 ) -> list[LabeledWindow]:
     """
     Match event markers to windowed signal segments and produce LabeledWindows.
@@ -618,11 +621,16 @@ def apply_events_to_windows(
         windows:      List of np.ndarray windows, each shape (n_channels, n_samples).
         events:       Sorted list of EventMarker objects.
         sample_rate:  Hz — used to compute window start times.
-        window_sec:   Duration of each window in seconds.
-        session_id:   UUID of the source session (for LabeledWindow.session_id).
-        step_samples: How many samples between window starts (for non-overlapping windows,
-                      step = window_samples; for 50% overlap, step = window_samples // 2).
-                      If None, defaults to window_samples (no overlap).
+        window_sec:         Duration of each window in seconds.
+        session_id:         UUID of the source session (for LabeledWindow.session_id).
+        run_id:             UUID of the pipeline run (for LabeledWindow.run_id).
+        step_samples:       How many samples between window starts (for non-overlapping windows,
+                            step = window_samples; for 50% overlap, step = window_samples // 2).
+                            If None, defaults to window_samples (no overlap).
+        signal_offset_sec:  Seconds to add to each window's start time. Non-zero when the
+                            pipeline includes a TruncateSignal step that removed the first N
+                            seconds — event markers are in original-recording time, but windows
+                            are indexed from 0 within the truncated signal.
 
     Returns:
         List of LabeledWindow objects, one per input window.
@@ -637,8 +645,10 @@ def apply_events_to_windows(
     labeled: list[LabeledWindow] = []
 
     for i, window in enumerate(windows):
-        # Calculate the time range this window covers
-        start_sec = (i * step_samples) / sample_rate
+        # Calculate the time range this window covers.
+        # signal_offset_sec shifts window times back into original-recording time
+        # so they align with event marker onsets (which use original recording time).
+        start_sec = signal_offset_sec + (i * step_samples) / sample_rate
         end_sec   = start_sec + window_sec
 
         # Find the event that is ACTIVE during this window's start time.
@@ -660,6 +670,7 @@ def apply_events_to_windows(
             label=         matched_label,
             start_time_sec=start_sec,
             session_id=    session_id,
+            run_id=        run_id,
         ))
 
     known    = sum(1 for lw in labeled if lw.label != "unknown")

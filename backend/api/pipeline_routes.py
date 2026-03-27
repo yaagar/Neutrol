@@ -49,6 +49,7 @@ class RunPipelineRequest(BaseModel):
     """Body for POST /api/pipeline/run."""
     session_id: str
     pipeline_config: dict   # PipelineConfig JSON dict from CLAUDE.md
+    name: str = ""          # Optional human-readable name for this run
 
 
 class SavePipelineRequest(BaseModel):
@@ -102,29 +103,42 @@ async def run_pipeline(request: RunPipelineRequest) -> JSONResponse:
     window_shape = list(windows[0].shape) if windows else [0, 0]
     steps_applied = [step.to_dict()["step"] for step in pipeline.steps]
 
+    # Determine signal_offset_sec from any TruncateSignal step.
+    # This offset is passed to apply_events_to_windows so event markers
+    # (in original-recording time) align with windows (in truncated-signal time).
+    signal_offset_sec = 0.0
+    for step_cfg in request.pipeline_config.get("steps", []):
+        if step_cfg.get("step") == "truncate":
+            signal_offset_sec = float(step_cfg.get("start_sec", 0.0))
+            break
+
     # Store as a dict (not a tuple) so /runs and /runs/{id}/window/{i} can read metadata
     # without loading all the numpy arrays into the response.
     store.pipeline_runs[run_id] = {
-        "session_id":    request.session_id,
-        "windows":       windows,           # list[np.ndarray] — never sent over API
-        "n_windows":     len(windows),
-        "window_shape":  window_shape,
-        "steps_applied": steps_applied,
-        "created_at":    datetime.now(timezone.utc).isoformat(),
+        "session_id":       request.session_id,
+        "name":             request.name,
+        "windows":          windows,           # list[np.ndarray] — never sent over API
+        "n_windows":        len(windows),
+        "window_shape":     window_shape,
+        "steps_applied":    steps_applied,
+        "signal_offset_sec": signal_offset_sec,
+        "created_at":       datetime.now(timezone.utc).isoformat(),
     }
 
     logger.info(
-        "Pipeline run %s: %d windows of shape %s for session %s",
-        run_id, len(windows), window_shape, request.session_id,
+        "Pipeline run %s ('%s'): %d windows of shape %s for session %s",
+        run_id, request.name, len(windows), window_shape, request.session_id,
     )
 
     return JSONResponse(
         status_code=200,
         content=api_response(True, data={
-            "run_id":        run_id,
-            "n_windows":     len(windows),
-            "window_shape":  window_shape,
-            "steps_applied": steps_applied,
+            "run_id":            run_id,
+            "name":              request.name,
+            "n_windows":         len(windows),
+            "window_shape":      window_shape,
+            "steps_applied":     steps_applied,
+            "signal_offset_sec": signal_offset_sec,
         }),
     )
 
@@ -146,12 +160,14 @@ async def list_runs() -> JSONResponse:
         if not isinstance(run, dict):
             continue
         results.append({
-            "run_id":        run_id,
-            "session_id":    run["session_id"],
-            "n_windows":     run["n_windows"],
-            "window_shape":  run["window_shape"],
-            "steps_applied": run["steps_applied"],
-            "created_at":    run["created_at"],
+            "run_id":            run_id,
+            "name":              run.get("name", ""),
+            "session_id":        run["session_id"],
+            "n_windows":         run["n_windows"],
+            "window_shape":      run["window_shape"],
+            "steps_applied":     run["steps_applied"],
+            "signal_offset_sec": run.get("signal_offset_sec", 0.0),
+            "created_at":        run["created_at"],
         })
     return JSONResponse(
         status_code=200,

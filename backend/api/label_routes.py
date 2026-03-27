@@ -50,6 +50,7 @@ def labeled_window_summary(lw: LabeledWindow) -> dict:
         "label":          lw.label,
         "start_time_sec": lw.start_time_sec,
         "session_id":     lw.session_id,
+        "run_id":         lw.run_id,
     }
 
 
@@ -133,12 +134,13 @@ async def save_labels(request: SaveLabelsRequest) -> JSONResponse:
             label=         lbl.label.strip(),
             start_time_sec=lbl.start_time_sec,
             session_id=    request.session_id,
+            run_id=        request.run_id,
         ))
 
-    # Store in session_id → list[LabeledWindow] dict.
-    # Overwrite any previous labels for this session — the UI always sends the
+    # Store keyed by run_id (not session_id) so training can target a specific run.
+    # Overwrite any previous labels for this run — the UI always sends the
     # full current set when the user hits "Save".
-    store.labeled_data[request.session_id] = labeled_windows
+    store.labeled_data[request.run_id] = labeled_windows
 
     # Build a summary of label counts for the response (useful for the UI to confirm)
     label_counts: dict[str, int] = {}
@@ -146,16 +148,17 @@ async def save_labels(request: SaveLabelsRequest) -> JSONResponse:
         label_counts[lw.label] = label_counts.get(lw.label, 0) + 1
 
     logger.info(
-        "Saved %d labels for session %s: %s",
-        len(labeled_windows), request.session_id, label_counts,
+        "Saved %d labels for run %s (session %s): %s",
+        len(labeled_windows), request.run_id, request.session_id, label_counts,
     )
 
     return JSONResponse(
         status_code=200,
         content=api_response(True, data={
-            "session_id":   request.session_id,
+            "session_id":    request.session_id,
+            "run_id":        request.run_id,
             "total_labeled": len(labeled_windows),
-            "label_counts": label_counts,
+            "label_counts":  label_counts,
         }),
     )
 
@@ -168,10 +171,21 @@ async def save_labels(request: SaveLabelsRequest) -> JSONResponse:
 async def get_labels(session_id: str) -> JSONResponse:
     """
     Return all saved labels for a session (metadata only — no numpy data).
+
+    Labeled data is now keyed by run_id in the store. This endpoint aggregates
+    all runs whose LabeledWindows have a matching session_id, so the TrainPage
+    can still call it without knowing which run_id to use.
+
     Returns an empty list if no labels have been saved yet.
     """
-    labeled_windows = store.labeled_data.get(session_id, [])
-    summaries = [labeled_window_summary(lw) for lw in labeled_windows]
+    # Aggregate across all run_id keys — each value is list[LabeledWindow]
+    all_windows: list[LabeledWindow] = []
+    for labeled_list in store.labeled_data.values():
+        for lw in labeled_list:
+            if lw.session_id == session_id:
+                all_windows.append(lw)
+
+    summaries = [labeled_window_summary(lw) for lw in all_windows]
 
     return JSONResponse(
         status_code=200,
@@ -241,6 +255,10 @@ async def labels_from_events(request: FromEventsRequest) -> JSONResponse:
             content=api_response(False, error="Pipeline run has no windows."),
         )
 
+    # Get signal_offset_sec from the run (set by any TruncateSignal step).
+    # This shifts window times back into original-recording time so event markers align.
+    signal_offset_sec = run.get("signal_offset_sec", 0.0)
+
     # Match events to windows and build LabeledWindows
     labeled_windows = apply_events_to_windows(
         windows=windows,
@@ -248,10 +266,12 @@ async def labels_from_events(request: FromEventsRequest) -> JSONResponse:
         sample_rate=session.sample_rate,
         window_sec=request.window_sec,
         session_id=request.session_id,
+        run_id=request.run_id,
+        signal_offset_sec=signal_offset_sec,
     )
 
-    # Store — overwrites any previous labels for this session
-    store.labeled_data[request.session_id] = labeled_windows
+    # Store keyed by run_id — overwrites any previous labels for this run
+    store.labeled_data[request.run_id] = labeled_windows
 
     # Build label count summary for the response
     label_counts: dict[str, int] = {}
@@ -259,14 +279,15 @@ async def labels_from_events(request: FromEventsRequest) -> JSONResponse:
         label_counts[lw.label] = label_counts.get(lw.label, 0) + 1
 
     logger.info(
-        "Auto-labeled %d windows from events for session %s: %s",
-        len(labeled_windows), request.session_id, label_counts,
+        "Auto-labeled %d windows from events for run %s (session %s): %s",
+        len(labeled_windows), request.run_id, request.session_id, label_counts,
     )
 
     return JSONResponse(
         status_code=200,
         content=api_response(True, data={
             "session_id":    request.session_id,
+            "run_id":        request.run_id,
             "total_labeled": len(labeled_windows),
             "label_counts":  label_counts,
         }),
@@ -277,18 +298,28 @@ async def labels_from_events(request: FromEventsRequest) -> JSONResponse:
 async def delete_labels(session_id: str) -> JSONResponse:
     """
     Clear all saved labels for a session.
-    Used when the user wants to start labeling over from scratch.
+
+    Since labeled_data is now keyed by run_id, this deletes all run entries
+    whose LabeledWindows belong to the given session_id.
     """
-    if session_id not in store.labeled_data:
+    # Find all run_ids that contain windows for this session
+    run_ids_to_delete = [
+        run_id
+        for run_id, lw_list in store.labeled_data.items()
+        if any(lw.session_id == session_id for lw in lw_list)
+    ]
+
+    if not run_ids_to_delete:
         return JSONResponse(
             status_code=404,
             content=api_response(False, error=f"No labels found for session '{session_id}'."),
         )
 
-    count = len(store.labeled_data[session_id])
-    del store.labeled_data[session_id]
+    count = sum(len(store.labeled_data[r]) for r in run_ids_to_delete)
+    for r in run_ids_to_delete:
+        del store.labeled_data[r]
 
-    logger.info("Deleted %d labels for session %s", count, session_id)
+    logger.info("Deleted %d labels across %d runs for session %s", count, len(run_ids_to_delete), session_id)
 
     return JSONResponse(
         status_code=200,
