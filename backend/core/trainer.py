@@ -90,7 +90,7 @@ def compute_confusion_matrix(y_true: list[int], y_pred: list[int], n_classes: in
 # run_training — the main training function, designed for a background thread
 # ---------------------------------------------------------------------------
 
-def run_training(job_id: str, session_id: str, model_config: dict) -> None:
+def run_training(job_id: str, session_id: str, model_config: dict, run_id: str | None = None) -> None:
     """
     Run the full training pipeline for one job.
 
@@ -108,6 +108,9 @@ def run_training(job_id: str, session_id: str, model_config: dict) -> None:
         job_id:       UUID identifying this training job.
         session_id:   UUID of the session whose labeled_data to train on.
         model_config: ModelConfig dict from CLAUDE.md.
+        run_id:       Optional pipeline run_id. labeled_data is keyed by run_id.
+                      If provided, look up directly. Otherwise aggregate all
+                      labeled windows for the session (fallback).
     """
     store = SessionStore()
 
@@ -123,9 +126,21 @@ def run_training(job_id: str, session_id: str, model_config: dict) -> None:
 
     try:
         # ------------------------------------------------------------------
-        # 1. Load labeled windows from the store
+        # 1. Load labeled windows from the store.
+        # labeled_data is keyed by run_id (not session_id). If run_id is provided,
+        # look it up directly. Otherwise fall back to aggregating all windows
+        # for this session across all runs.
         # ------------------------------------------------------------------
-        labeled_windows = store.labeled_data.get(session_id, [])
+        if run_id:
+            labeled_windows = store.labeled_data.get(run_id, [])
+        else:
+            labeled_windows = [
+                lw
+                for lw_list in store.labeled_data.values()
+                for lw in lw_list
+                if lw.session_id == session_id
+            ]
+
         if len(labeled_windows) < MIN_SAMPLES:
             fail(
                 f"Need at least {MIN_SAMPLES} labeled windows to train, "

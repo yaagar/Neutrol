@@ -47,15 +47,14 @@ export default function TrainPage() {
   // WebSocket ref — managed manually for fine-grained connect/disconnect control
   const wsRef = useRef(null)
 
-  // --- On session change: reset run selection, reload runs + labels ---
+  // --- On session change: reset run selection and reload runs ---
+  // We do NOT call fetchLabelSummary() here — it fires automatically via the
+  // useEffect([selectedRunId]) below once fetchRuns() sets the new run_id.
+  // Calling it here would race against the run selection update.
   useEffect(() => {
     if (!currentSession) return
-    // Reset the run selection when switching sessions so we don't carry over a
-    // stale run_id from the previous session — that would make the label filter
-    // return 0 results for the new session's labels.
     setTrainPageState({ selectedRunId: null })
     fetchRuns()
-    fetchLabelSummary()
   }, [currentSession?.session_id])
 
   // --- Reconnect WebSocket when jobId is set (e.g. after page refresh restores state) ---
@@ -122,20 +121,23 @@ export default function TrainPage() {
     finally { setRunsLoading(false) }
   }
 
-  async function fetchLabelSummary() {
+  // runId is passed explicitly to avoid stale-closure issues.
+  // When a run is selected, we call GET /api/labels/by-run/{runId} directly —
+  // no client-side filtering needed, and no risk of a concurrent call with the
+  // wrong closed-over selectedRunId overwriting the result.
+  async function fetchLabelSummary(runId) {
     if (!currentSession) return
     setLabelsLoading(true)
     try {
-      const res  = await fetch(`${API}/api/labels/${currentSession.session_id}`)
+      const url = runId
+        ? `${API}/api/labels/by-run/${runId}`
+        : `${API}/api/labels/${currentSession.session_id}`
+      const res  = await fetch(url)
       const json = await res.json()
       if (json.success) {
-        // Build counts for labels that belong to the selected run
-        const relevantLabels = selectedRunId
-          ? json.data.labels.filter(l => l.run_id === selectedRunId)
-          : json.data.labels
         const counts = {}
-        relevantLabels.forEach(l => { counts[l.label] = (counts[l.label] || 0) + 1 })
-        setLabelSummary({ total: relevantLabels.length, counts })
+        json.data.labels.forEach(l => { counts[l.label] = (counts[l.label] || 0) + 1 })
+        setLabelSummary({ total: json.data.total_labeled, counts })
       }
     } catch {
       setLabelSummary(null)
@@ -206,9 +208,10 @@ export default function TrainPage() {
     finally { setRenaming(false) }
   }
 
-  // Refresh label summary when selected run changes
+  // Refresh label summary whenever the selected run changes.
+  // Pass selectedRunId explicitly so fetchLabelSummary always uses the current value.
   useEffect(() => {
-    if (currentSession) fetchLabelSummary()
+    if (currentSession) fetchLabelSummary(selectedRunId)
   }, [selectedRunId])
 
   // -------------------------------------------------------------------------
@@ -330,7 +333,7 @@ export default function TrainPage() {
               </span>
             ))}
             <button
-              onClick={fetchLabelSummary}
+              onClick={() => fetchLabelSummary(selectedRunId)}
               className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
             >
               Refresh

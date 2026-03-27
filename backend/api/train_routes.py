@@ -254,9 +254,12 @@ async def start_training(request: StartTrainingRequest) -> JSONResponse:
 
     # Start training in a daemon thread.
     # daemon=True means the thread will not block the process from exiting.
+    # Pass run_id so the trainer looks up labeled_data by run_id (not session_id).
+    # labeled_data is keyed by run_id — looking up by session_id always returns [].
     thread = threading.Thread(
         target=run_training,
         args=(job_id, request.session_id, model_config),
+        kwargs={"run_id": request.run_id},
         daemon=True,
         name=f"train-{job_id[:8]}",
     )

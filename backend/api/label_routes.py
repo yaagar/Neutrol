@@ -167,6 +167,30 @@ async def save_labels(request: SaveLabelsRequest) -> JSONResponse:
 # GET /api/labels/{session_id}
 # ---------------------------------------------------------------------------
 
+@router.get("/by-run/{run_id}")
+async def get_labels_by_run(run_id: str) -> JSONResponse:
+    """
+    Return all saved labels for a specific pipeline run (metadata only).
+
+    This is the preferred endpoint for the TrainPage label summary — it looks up
+    labels directly by run_id (the key in store.labeled_data) so there is no
+    client-side filtering and no risk of stale-closure mismatches.
+
+    Returns an empty list if no labels exist for this run yet.
+    """
+    labeled_list = store.labeled_data.get(run_id, [])
+    summaries = [labeled_window_summary(lw) for lw in labeled_list]
+
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={
+            "run_id":        run_id,
+            "total_labeled": len(summaries),
+            "labels":        summaries,
+        }),
+    )
+
+
 @router.get("/{session_id}")
 async def get_labels(session_id: str) -> JSONResponse:
     """
