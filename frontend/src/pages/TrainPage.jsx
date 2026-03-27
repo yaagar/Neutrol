@@ -47,9 +47,13 @@ export default function TrainPage() {
   // WebSocket ref — managed manually for fine-grained connect/disconnect control
   const wsRef = useRef(null)
 
-  // --- On session change: reload runs + labels, but keep training state ---
+  // --- On session change: reset run selection, reload runs + labels ---
   useEffect(() => {
     if (!currentSession) return
+    // Reset the run selection when switching sessions so we don't carry over a
+    // stale run_id from the previous session — that would make the label filter
+    // return 0 results for the new session's labels.
+    setTrainPageState({ selectedRunId: null })
     fetchRuns()
     fetchLabelSummary()
   }, [currentSession?.session_id])
@@ -107,8 +111,10 @@ export default function TrainPage() {
       if (json.success) {
         const sessionRuns = json.data.filter(r => r.session_id === currentSession.session_id)
         setRuns(sessionRuns)
-        // Auto-select most recent run if none selected
-        if (sessionRuns.length > 0 && !selectedRunId) {
+        // Always select the most recent run for this session.
+        // Not using !selectedRunId check because the previous session's run_id
+        // could still be in Zustand state after a session switch.
+        if (sessionRuns.length > 0) {
           setTrainPageState({ selectedRunId: sessionRuns[sessionRuns.length - 1].run_id })
         }
       }

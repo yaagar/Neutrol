@@ -166,15 +166,24 @@ export default function LabelPage() {
   }
 
   async function loadExistingLabels() {
+    if (!activeRun) return
     try {
       const res = await fetch(`${API}/api/labels/${currentSession.session_id}`)
       const json = await res.json()
       if (json.success && json.data.labels.length > 0) {
-        // Reconstruct the {windowIndex: label} map from saved labels.
-        // We match by start_time_sec order since window_index isn't stored directly.
-        // For simplicity, we just prefill labels in order.
+        // IMPORTANT: filter to ONLY this run's labels.
+        // GET /api/labels/{session_id} returns labels from ALL runs for the session.
+        // Loading labels from other runs would corrupt the window-index mapping —
+        // e.g. run A has 150 windows and run B has 249: loading both and saving to B
+        // would produce indices 0-398, causing "window index out of range" errors.
+        const runLabels = json.data.labels.filter(l => l.run_id === activeRun.run_id)
+        if (runLabels.length === 0) return   // no labels saved yet for this run
+
+        // Rebuild the {windowIndex: label} map.
+        // Labels are stored in window order (0..n_windows-1), so the array index
+        // directly maps to window_index.
         const rebuilt = {}
-        json.data.labels.forEach((lbl, i) => { rebuilt[i] = lbl.label })
+        runLabels.forEach((lbl, i) => { rebuilt[i] = lbl.label })
         setLabels(rebuilt)
       }
     } catch {
@@ -431,13 +440,18 @@ export default function LabelPage() {
               value={activeRun?.run_id || ''}
               onChange={e => {
                 const run = runs.find(r => r.run_id === e.target.value)
-                if (run) { setActiveRun(run); setWindowIndex(0); setLabels({}) }
+                if (run) {
+                  setActiveRun(run)
+                  setWindowIndex(0)
+                  setLabels({})       // clear labels — will reload for new run via useEffect
+                  setSaveResult(null)
+                }
               }}
               className="bg-gray-800 border border-gray-700 text-sm text-gray-200 rounded px-2 py-1 focus:outline-none"
             >
               {runs.map(r => (
                 <option key={r.run_id} value={r.run_id}>
-                  {r.n_windows} windows — {r.created_at?.slice(0, 10)}
+                  {r.name ? `${r.name} — ` : ''}{r.n_windows} windows ({r.steps_applied?.join('→')})
                 </option>
               ))}
             </select>
