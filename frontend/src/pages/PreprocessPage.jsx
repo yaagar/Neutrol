@@ -12,7 +12,8 @@ import FrequencyChart from '../components/FrequencyChart'
 import BandPowerChart from '../components/BandPowerChart'
 import SpectrogramChart from '../components/SpectrogramChart'
 
-const API = 'http://localhost:8000'
+import { API_BASE_URL } from '../config'
+const API = API_BASE_URL
 
 // Available steps the user can add to the pipeline.
 // Each entry defines the label shown in the dropdown and the default config

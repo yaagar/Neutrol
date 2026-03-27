@@ -8,7 +8,29 @@
       "Bash(./venv/Scripts/pip install:*)",
       "Bash(npm run:*)",
       "Bash(python -:*)",
-      "Bash(\"C:/Users/yasha/OneDrive/Documents/Programming/Python/Neutrol/venv/Scripts/python.exe\" -c \":*)"
+      "Bash(\"C:/Users/yasha/OneDrive/Documents/Programming/Python/Neutrol/venv/Scripts/python.exe\" -c \":*)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(curl:*)",
+      "Bash(SESSION=\"773b84f1-97f8-489b-9486-a02b1947408a\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); steps=[s[''''step''''] for s in d[''''data'''']]; print\\(''''Steps:'''', steps\\)\")",
+      "Bash(python3:*)",
+      "Bash(venv/Scripts/python -c \":*)",
+      "Bash(EDF=\"/c/Users/yasha/OneDrive/Documents/Programming/Python/Neutrol/backend/temp/S001R03.edf\")",
+      "Bash(PROJ=\"/c/Users/yasha/OneDrive/Documents/Programming/Python/Neutrol\")",
+      "Bash(venv/Scripts/python.exe:*)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill /F /PID 45080 sleep 1 netstat -ano)",
+      "Bash(cmd /c \"taskkill /F /PID 45080\")",
+      "Bash(cmd //c \"taskkill /F /PID 45080\")",
+      "Bash(cmd //c \"tasklist /FI \\\\\"PID eq 45080\\\\\" /V\")",
+      "Bash(wmic process:*)",
+      "Bash(cmd //c 'taskkill /F /PID 45080' 2)",
+      "Bash(/dev/null netstat:*)",
+      "Bash(xargs -I{} cmd //c 'taskkill /F /PID {}' 2)",
+      "Bash(/dev/null sleep:*)",
+      "Bash(cmd //c \"wmic process where \\\\\"ProcessId=36604\\\\\" get Name,CommandLine\")",
+      "Bash(cmd //c \"tasklist /FI \\\\\"PID eq 36604\\\\\"\")",
+      "Bash(cmd //c 'taskkill /F /IM python.exe /IM python3.exe /IM uvicorn.exe')"
     ]
   }
 }

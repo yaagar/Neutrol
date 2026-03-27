@@ -13,7 +13,8 @@ import { useState, useEffect, useCallback } from 'react'
 import { useSession } from '../hooks/useSession'
 import WaveformChart from '../components/WaveformChart'
 
-const API = 'http://localhost:8000'
+import { API_BASE_URL } from '../config'
+const API = API_BASE_URL
 
 // Predefined label options — the most common BCI classes.
 // The user can also type a custom label.

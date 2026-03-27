@@ -16,8 +16,9 @@ import {
 import { useSession } from '../hooks/useSession'
 import ModelLayerEditor from '../components/ModelLayerEditor'
 
-const API    = 'http://localhost:8000'
-const WS_API = 'ws://localhost:8000'
+import { API_BASE_URL, WS_BASE_URL } from '../config'
+const API    = API_BASE_URL
+const WS_API = WS_BASE_URL
 
 // Default model configuration — matches CLAUDE.md ModelConfig spec
 const DEFAULT_CONFIG = {

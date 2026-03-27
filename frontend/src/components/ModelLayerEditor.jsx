@@ -13,7 +13,8 @@
 
 import { useState, useEffect } from 'react'
 
-const API = 'http://localhost:8000'
+import { API_BASE_URL } from '../config'
+const API = API_BASE_URL
 
 // Color per layer type for the left border of each card
 const LAYER_COLORS = {

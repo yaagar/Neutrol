@@ -9,8 +9,8 @@ import { useState, useEffect, useRef } from 'react'
 import { useSession } from '../hooks/useSession'
 import WaveformChart from '../components/WaveformChart'
 
-// Base URL for all API calls. Defined once here so it's easy to change.
-const API = 'http://localhost:8000'
+import { API_BASE_URL } from '../config'
+const API = API_BASE_URL
 
 export default function ImportPage() {
   // Read session state and write actions from the Zustand store
