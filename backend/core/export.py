@@ -29,7 +29,6 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 
 _SCRIPT_TEMPLATE = '''\
-#!/usr/bin/env python3
 """
 Neutrol Auto-Generated Inference Script
 Model: {model_name}
@@ -207,7 +206,7 @@ def _build_model(config: dict) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 # Path to the .pt file — must be in the same directory as this script.
-CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "{job_id}.pt")
+CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "{checkpoint_filename}")
 
 _cached_model   = None
 _cached_classes = None
@@ -340,15 +339,18 @@ def generate_inference_script(
     n_channels = checkpoint.get("n_channels", 0)
     n_samples  = checkpoint.get("n_samples",  0)
 
-    script_name = f"neutrol_inference_{job_id[:8]}"
+    script_name         = f"neutrol_inference_{job_id[:8]}"
+    # Use the same stem as the downloaded .pt file so they always match by default
+    checkpoint_filename = f"{(model_name or job_id[:8]).replace(' ', '_')}.pt"
 
     return _SCRIPT_TEMPLATE.format(
-        job_id       = job_id,
-        model_name   = model_name or f"model_{job_id[:8]}",
-        classes_str  = ", ".join(classes),
-        trained_at   = trained_at,
-        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        script_name  = script_name,
-        n_channels   = n_channels,
-        n_samples    = n_samples,
+        job_id              = job_id,
+        model_name          = model_name or f"model_{job_id[:8]}",
+        classes_str         = ", ".join(classes),
+        trained_at          = trained_at,
+        generated_at        = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        script_name         = script_name,
+        n_channels          = n_channels,
+        n_samples           = n_samples,
+        checkpoint_filename = checkpoint_filename,
     )

@@ -52,7 +52,7 @@ def api_response(success: bool, data=None, error: str | None = None) -> dict:
 # GET /api/export/pipeline/{run_id}
 # ---------------------------------------------------------------------------
 
-@router.get("/pipeline/{run_id}")
+@router.get("/pipeline/{run_id}", response_model=None)
 async def export_pipeline(run_id: str) -> JSONResponse:
     """
     Return the full pipeline config for a run as a JSON file download.
@@ -97,7 +97,7 @@ async def export_pipeline(run_id: str) -> JSONResponse:
 # GET /api/export/model/{job_id}
 # ---------------------------------------------------------------------------
 
-@router.get("/model/{job_id}")
+@router.get("/model/{job_id}", response_model=None)
 async def export_model(job_id: str) -> FileResponse | JSONResponse:
     """
     Download the trained model weights (.pt file) for a completed training job.
@@ -149,7 +149,7 @@ async def export_model(job_id: str) -> FileResponse | JSONResponse:
 # GET /api/export/script/{job_id}
 # ---------------------------------------------------------------------------
 
-@router.get("/script/{job_id}")
+@router.get("/script/{job_id}", response_model=None)
 async def export_script(job_id: str) -> PlainTextResponse | JSONResponse:
     """
     Generate and download a standalone Python inference script for a trained model.
