@@ -9,7 +9,7 @@
 ::
 :: Requirements:
 ::   - Python 3.11+ with pip (in PATH or a venv activated)
-::   - pip install pyinstaller  (in the same env as the backend deps)
+::     (pip install is handled automatically by this script)
 ::   - Node.js + npm (in PATH)
 ::   - Rust + cargo (in PATH)  — install from https://rustup.rs
 ::   - Visual Studio Build Tools (for Rust on Windows)
@@ -22,6 +22,16 @@ setlocal enabledelayedexpansion
 echo ============================================================
 echo  Neutrol — Desktop App Builder (Windows)
 echo ============================================================
+echo.
+
+:: Step 0: Install Python dependencies (backend + PyInstaller)
+echo [0/3] Installing Python dependencies...
+python -m pip install -r backend\requirements.txt pyinstaller
+if %ERRORLEVEL% neq 0 (
+    echo ERROR: pip install failed. Make sure Python is in PATH.
+    pause
+    exit /b 1
+)
 echo.
 
 :: Step 1: Build the Python backend sidecar
