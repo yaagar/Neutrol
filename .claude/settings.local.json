@@ -33,7 +33,8 @@
       "Bash(cmd //c 'taskkill /F /IM python.exe /IM python3.exe /IM uvicorn.exe')",
       "Bash(python:*)",
       "Bash(tasklist /FI 'PID eq 49076')",
-      "Bash(gh repo:*)"
+      "Bash(gh repo:*)",
+      "Bash(\"C:\\\\Users\\\\yasha\\\\OneDrive\\\\Documents\\\\Programming\\\\Python\\\\Neutrol\\\\.gitignore\":*)"
     ]
   }
 }
