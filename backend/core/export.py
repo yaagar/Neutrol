@@ -593,16 +593,22 @@ def export_onnx(job_id: str, model_path: str, export_dir: str) -> str:
     os.makedirs(export_dir, exist_ok=True)
     onnx_path = os.path.join(export_dir, f"{job_id}.onnx")
 
-    # dynamic_axes lets onnxruntime accept any batch size at inference time
-    torch.onnx.export(
-        model,
-        dummy,
-        onnx_path,
-        opset_version=12,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
-    )
+    # PyTorch 2.x prints emoji-laden progress messages during export.
+    # On Windows (cp1252 terminal) these cause UnicodeEncodeError.
+    # Redirecting stdout to a StringIO buffer suppresses the noise safely.
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        # dynamic_axes lets onnxruntime accept any batch size at inference time
+        torch.onnx.export(
+            model,
+            dummy,
+            onnx_path,
+            opset_version=18,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+        )
 
     logger.info("ONNX model exported to %s", onnx_path)
     return onnx_path
