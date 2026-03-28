@@ -653,8 +653,8 @@ InferencePage output section: two `OutputCard` tiles, each with a `ToggleSwitch`
 | P2-S1 | ✅ Done | Inference script preprocessing + ONNX + microcontroller export + BrainFlow backend |
 | P2-S2 | ✅ Done | InferencePage source toggle (Simulated/File Playback/Hardware) + Output system (WebSocket server + Serial port) |
 | P2-S3 | ✅ Done | Fine-tuning training + model history + model comparison + data augmentation |
-| **P2-S4** | **Next** | PreprocessPage dashboard multi-graph view |
-| P2-S5 | Upcoming | Tauri desktop app conversion |
+| P2-S4 | ✅ Done | PreprocessPage dashboard multi-graph view |
+| **P2-S5** | **Next** | Tauri desktop app conversion |
 
 ---
 
@@ -701,6 +701,24 @@ InferencePage output section: two `OutputCard` tiles, each with a `ToggleSwitch`
 - Checkbox list of all done models
 - Side-by-side table computed from confusion matrix: Overall Accuracy, per-class precision/recall/F1
 - Results fetched on-demand via `GET /api/train/{job_id}/results`
+
+## Part 2 Session 4 — What Was Actually Built ✅
+
+### PreprocessPage Dashboard View
+
+**`frontend/src/pages/PreprocessPage.jsx`** — frontend-only change. All 4 backend analysis endpoints unchanged.
+
+**View mode toggle** added to the top of the analysis panel:
+- `☰ Tabs` — existing behaviour (one chart at a time, full width)
+- `⊞ Dashboard` — new 2×2 grid showing all 4 charts simultaneously
+
+**Dashboard behaviour:**
+- Switching to Dashboard fires `fetchAllDashboard()` which uses `Promise.all` to fire all 4 API calls simultaneously. Each tile has its own loading flag (`dashLoading.{time,frequency,bandpower,spectrogram}`) so they fill in independently as results arrive.
+- Each tile has a `⤢` expand button that shows that chart full-width with a `← Back to Dashboard` nav link.
+- Before/After toggle and channel selector apply to all 4 charts simultaneously (previously only shown for the active tab — in dashboard mode they're always visible).
+- `viewMode` and `expandedChart` are local state (not persisted in Zustand) — intentional, tab layout preferences don't need to survive navigation.
+
+---
 
 ### Label Class Manager (hotfix after P2-S3)
 
