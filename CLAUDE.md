@@ -585,13 +585,74 @@ pyinstaller --onefile --name neutrol-backend backend/main.py
 
 ---
 
+## Part 2 Session 2 — What Was Actually Built ✅
+
+### Source Toggle — three inference modes
+
+**`frontend/src/pages/InferencePage.jsx`** — complete rewrite. Source toggle at top switches between three modes without re-mounting the prediction display:
+
+- **Simulated** — original behaviour, `mode: "run"` on `/ws/stream-run`
+- **File Playback** — new `mode: "playback"` on `/ws/stream-run`. User picks any loaded DataSession + a reference pipeline run (for window shape). Backend re-slices the raw signal into windows on the fly — nothing pre-computed
+- **Hardware** — board dropdown (from `/hardware/boards`), optional serial port input, Connect/Disconnect button, live status badge. Uses `/ws/hardware` once connected
+
+All three feed the same prediction display: large class badge + confidence bars + scrolling history ribbon. No duplicate code.
+
+### File Playback mode
+
+**`backend/api/inference_routes.py`** — `/ws/stream-run` now reads a `mode` field from the start message:
+- `"run"` → original: iterates `store.pipeline_runs[run_id]["windows"]`
+- `"playback"` → new: fetches `store.sessions[session_id].signals`, slices into `n_samp` windows sequentially. Window shape comes from the reference run's `window_shape` field, or falls back to the model's `n_channels`/`n_samples`
+
+### OutputDispatcher
+
+**`backend/core/inference.py`** — new `OutputDispatcher` class. Two independent outputs, both optional, both can run simultaneously:
+
+1. **WebSocket server** — Neutrol acts as a WS server (`websockets.serve`) on a configurable port. External Python/Node.js code connects as a client and receives `{label, confidence, timestamp}` JSON after every prediction. Client set managed as a Python `set`; dead clients removed on send error.
+
+2. **Serial port** — opens a `pyserial.Serial` connection. After each prediction, looks up the label in a user-configured `serial_map` (e.g. `{"left": "L\n"}`) and writes that string to the port. Escape sequences in map values are decoded (so `"L\\n"` becomes `"L"` + newline).
+
+`dispatch(label, confidence)` is called after every prediction in both `/ws/stream-run` and `/ws/hardware` — regardless of which source is active.
+
+**`backend/sessions/session_store.py`** — added `output_dispatcher = OutputDispatcher()` and `output_config = {}` to singleton.
+
+### Output API endpoints
+
+**`backend/api/inference_routes.py`** — three new endpoints:
+- `GET /output/serial-ports` — `serial.tools.list_ports.comports()`, returns `{port, description}` list + `pyserial_available` flag
+- `POST /output/config` — body: `{ws_enabled, ws_port, serial_enabled, serial_port, serial_baud, serial_map}`. Starts/stops/restarts WS server, opens/closes serial port. Saves config to `store.output_config`
+- `GET /output/config` — returns live status (`ws_running`, `ws_clients`, `serial_open`) + last saved config
+
+### Output UI
+
+InferencePage output section: two `OutputCard` tiles, each with a `ToggleSwitch`:
+- **WebSocket card** — port input, running status with client count, collapsible Python code snippet, Apply button
+- **Serial card** — port dropdown (refreshable), baud dropdown (9600/57600/115200), per-class string table (editable rows, auto-populated when class names arrive from the WS), Apply button
+
+### Integration test results (all passed)
+
+| Test | Result |
+|---|---|
+| run mode | 10 predictions streamed |
+| playback mode | 10 predictions sliced from raw session signal |
+| Output WS external client | Received `{label, confidence, timestamp}` |
+| WS server stop | `ws_running: false` |
+| Hardware (synthetic) | connect/disconnect OK |
+| Serial ports endpoint | `pyserial_available: true` |
+
+### Known issues from P2-S2
+
+- Serial port send not tested with real hardware (no physical device in test environment — endpoint verified to open/close correctly)
+- Output WS server port must not conflict with the FastAPI server (port 8000); default 8765 is safe
+
+---
+
 ## Part 2 Session Roadmap
 
 | Session | Status | What gets built |
 |---|---|---|
 | P2-S1 | ✅ Done | Inference script preprocessing + ONNX + microcontroller export + BrainFlow backend |
-| **P2-S2** | **Next** | InferencePage source toggle (Simulated/File Playback/Hardware) + Output system (WebSocket server + Serial port) + Action mapper UI |
-| P2-S3 | Upcoming | Fine-tuning training + model history + model comparison + data augmentation |
+| P2-S2 | ✅ Done | InferencePage source toggle (Simulated/File Playback/Hardware) + Output system (WebSocket server + Serial port) |
+| **P2-S3** | **Next** | Fine-tuning training + model history + model comparison + data augmentation |
 | P2-S4 | Upcoming | PreprocessPage dashboard multi-graph view |
 | P2-S5 | Upcoming | Tauri desktop app conversion |
 
@@ -599,7 +660,6 @@ pyinstaller --onefile --name neutrol-backend backend/main.py
 
 ## Known Issues
 
-- **InferencePage Source toggle missing** — UI not built yet; hardware WebSocket endpoint works
 - **Old .pt checkpoints missing pipeline_config** — models trained before P2-S1 get "No preprocessing recorded" in generated script; retrain to fix
 - **Microcontroller export optional deps** — `tensorflow` + `onnx2tf` not in requirements.txt; returns HTTP 422 with install message if missing
 - **Session nicknames reset on refresh** — Zustand only, intentional for now
