@@ -65,9 +65,11 @@ Design philosophy: Like Arduino IDE. Simple for beginners, fully editable for ex
 | scikit-learn | Confusion matrix, classification metrics |
 | python-multipart | File uploads |
 | websockets | Real-time streaming and inference |
-| **onnx** | NEW (Part 2) — Export PyTorch model to ONNX format |
-| **onnxruntime** | NEW (Part 2) — Run ONNX models on edge devices (Raspberry Pi etc.) |
-| **brainflow** | NEW (Part 2) — Unified API for 30+ live EEG hardware devices |
+| onnx | Export PyTorch model to ONNX format |
+| onnxruntime | Run ONNX models on edge devices |
+| onnxscript | Required by torch.onnx.export in PyTorch 2.x |
+| brainflow | Unified API for 30+ live EEG hardware devices |
+| pyserial | NEW (P2-S2) — Send predictions over serial/COM port to microcontrollers |
 
 ---
 
@@ -79,8 +81,8 @@ Neutrol/
 ├── README.md
 ├── frontend/
 │   ├── src/
-│   │   ├── config.js                     ← API_BASE_URL = 'http://localhost:8000'
-│   │   ├── App.jsx                       ← Root component, routing, sidebar
+│   │   ├── config.js                      ← API_BASE_URL = 'http://localhost:8000'
+│   │   ├── App.jsx
 │   │   ├── components/
 │   │   │   ├── Sidebar.jsx
 │   │   │   ├── StatusBar.jsx
@@ -92,11 +94,11 @@ Neutrol/
 │   │   │   └── ModelLayerEditor.jsx
 │   │   ├── pages/
 │   │   │   ├── ImportPage.jsx
-│   │   │   ├── PreprocessPage.jsx
+│   │   │   ├── PreprocessPage.jsx         ← P2-S4: dashboard multi-graph view
 │   │   │   ├── LabelPage.jsx
-│   │   │   ├── TrainPage.jsx
-│   │   │   ├── InferencePage.jsx         ← UPDATED Part 2: real hardware streaming
-│   │   │   └── ExportPage.jsx            ← UPDATED Part 2: ONNX + microcontroller export
+│   │   │   ├── TrainPage.jsx              ← P2-S3: fine-tuning + augmentation
+│   │   │   ├── InferencePage.jsx          ← P2-S2: source toggle + output system
+│   │   │   └── ExportPage.jsx
 │   │   ├── hooks/
 │   │   │   ├── useSession.js
 │   │   │   └── useWebSocket.js
@@ -109,18 +111,18 @@ Neutrol/
 │   │   ├── pipeline_routes.py
 │   │   ├── analysis_routes.py
 │   │   ├── label_routes.py
-│   │   ├── train_routes.py
-│   │   ├── inference_routes.py           ← UPDATED Part 2: BrainFlow hardware endpoint
-│   │   └── export_routes.py              ← UPDATED Part 2: ONNX + microcontroller endpoints
+│   │   ├── train_routes.py                ← P2-S3: fine-tuning endpoint
+│   │   ├── inference_routes.py            ← P2-S2: hardware + file playback + output
+│   │   └── export_routes.py
 │   ├── core/
 │   │   ├── data_loader.py
 │   │   ├── preprocessing.py
 │   │   ├── analysis.py
 │   │   ├── models.py
-│   │   ├── trainer.py
-│   │   ├── inference.py
-│   │   └── export.py                     ← UPDATED Part 2: ONNX export + C array generation
-│   └── sessions/session_store.py
+│   │   ├── trainer.py                     ← P2-S3: fine-tuning support
+│   │   ├── inference.py                   ← P2-S2: HardwareStreamer + OutputDispatcher
+│   │   └── export.py
+│   └── sessions/session_store.py          ← P2-S2: output_config + hardware_streamer
 ├── configs/
 ├── datasets/sample_eeg.csv
 └── exports/
@@ -162,7 +164,7 @@ class EventMarker:
     description: str
 ```
 
-PipelineConfig JSON format:
+PipelineConfig JSON (notch before bandpass — notch removes 60Hz harmonics first):
 ```json
 {
   "pipeline_id": "uuid",
@@ -178,8 +180,6 @@ PipelineConfig JSON format:
 }
 ```
 
-**Note: notch before bandpass. Notch removes 60Hz harmonics before bandpass cuts the range.**
-
 Every API endpoint returns:
 ```json
 { "success": true, "data": {}, "error": null }
@@ -189,19 +189,19 @@ Every API endpoint returns:
 
 ## SessionStore
 
-Singleton in-memory store. All route files share the same instance.
-
 ```python
 class SessionStore:
     _instance = None
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance.sessions = {}         # session_id → DataSession
-            cls._instance.pipeline_runs = {}    # run_id → {windows, start_times, sample_rate, pipeline_config}
-            cls._instance.labeled_data = {}     # run_id → list[LabeledWindow]
-            cls._instance.training_jobs = {}    # job_id → training state dict
-            cls._instance.event_markers = {}    # session_id → list[EventMarker]
+            cls._instance.sessions = {}          # session_id → DataSession
+            cls._instance.pipeline_runs = {}     # run_id → {windows, start_times, sample_rate, pipeline_config}
+            cls._instance.labeled_data = {}      # run_id → list[LabeledWindow]
+            cls._instance.training_jobs = {}     # job_id → training state dict
+            cls._instance.event_markers = {}     # session_id → list[EventMarker]
+            cls._instance.hardware_streamer = None  # HardwareStreamer | None
+            cls._instance.output_config = {}     # current output destination config
         return cls._instance
 ```
 
@@ -210,8 +210,6 @@ class SessionStore:
 ## API Endpoint Map
 
 ### Data `/api/data/`
-| Method | Path | Does |
-|---|---|---|
 | POST | `/upload` | Upload .csv or .edf → session_id + metadata |
 | POST | `/upload-events` | Upload event file → EventMarker list |
 | GET | `/sessions` | List all sessions |
@@ -219,8 +217,6 @@ class SessionStore:
 | DELETE | `/{session_id}` | Remove session |
 
 ### Pipeline `/api/pipeline/`
-| Method | Path | Does |
-|---|---|---|
 | POST | `/run` | Run pipeline → run_id + window count |
 | GET | `/steps` | All available steps + parameters |
 | POST | `/save` | Save config to configs/ |
@@ -236,37 +232,42 @@ class SessionStore:
 | POST | `/save` | Save LabeledWindows (manual) |
 | POST | `/from-events` | Auto-label from EventMarkers |
 | GET | `/{session_id}` | All labels for session |
-| GET | `/by-run/{run_id}` | Labels for specific run (must be defined BEFORE /{session_id}) |
+| GET | `/by-run/{run_id}` | Labels for run (define BEFORE `/{session_id}`) |
 | DELETE | `/{session_id}` | Clear labels |
 
 ### Train `/api/train/`
 | POST | `/validate-config` | Validate ModelConfig + layer shapes |
 | GET | `/layer-types` | All layer types + parameters |
-| POST | `/start` | Start training → job_id |
+| POST | `/start` | Start training from scratch → job_id |
+| POST | `/finetune` | NEW: Continue training from existing model → job_id |
 | GET | `/{job_id}/status` | Progress (epoch, loss, accuracy) |
 | GET | `/{job_id}/results` | Final metrics + confusion matrix |
+| GET | `/history/{model_name}` | NEW: All training runs for a model name |
 
 ### Inference `/api/inference/`
 | POST | `/predict` | Single prediction → class + confidence |
-| WS | `/ws/inference/stream` | WebSocket stream inference |
-| GET | `/hardware/boards` | NEW: List supported BrainFlow board IDs |
-| POST | `/hardware/connect` | NEW: Connect to live EEG device via BrainFlow |
-| POST | `/hardware/disconnect` | NEW: Disconnect hardware |
-| WS | `/ws/inference/hardware` | NEW: WebSocket stream from real hardware |
+| WS | `/ws/stream-run` | WebSocket: simulated or file playback stream |
+| GET | `/hardware/boards` | List supported BrainFlow board IDs |
+| POST | `/hardware/connect` | Connect to live EEG device |
+| POST | `/hardware/disconnect` | Disconnect hardware |
+| WS | `/ws/hardware` | WebSocket: stream from real hardware |
+| GET | `/output/serial-ports` | NEW: List available COM/serial ports |
+| POST | `/output/config` | NEW: Set output destination config |
+| GET | `/output/config` | NEW: Get current output config |
 
 ### Export `/api/export/`
 | GET | `/pipeline/{run_id}` | Pipeline config JSON |
 | GET | `/model/{job_id}` | Model weights .pt |
-| GET | `/script/{job_id}` | Python inference script (with preprocessing embedded) |
-| GET | `/onnx/{job_id}` | NEW: ONNX model file |
-| GET | `/onnx-script/{job_id}` | NEW: Python ONNX inference script |
-| GET | `/microcontroller/{job_id}` | NEW: ZIP with model_data.h + neutrol_inference.cpp + README |
+| GET | `/script/{job_id}` | Python inference script (preprocessing embedded) |
+| GET | `/onnx/{job_id}` | ONNX model file |
+| GET | `/onnx-script/{job_id}` | Python ONNX inference script |
+| GET | `/microcontroller/{job_id}` | ZIP with model_data.h + neutrol_inference.cpp + README |
 
 ---
 
-## Part 1 — What Is Built (Sessions 1–9) ✅
+## Part 1 — Built (Sessions 1–9) ✅
 
-All MVP features complete:
+All MVP features complete. Key items:
 - EEG file import (CSV, EDF, event files)
 - Preprocessing pipeline (notch, bandpass, reref, normalize, window, channel selector, epoch rejection, ICA)
 - Signal analysis (FFT, PSD, band power, spectrogram) with Before/After toggle
@@ -274,352 +275,334 @@ All MVP features complete:
 - Dynamic CNN training (fully editable layer architecture)
 - Training results (loss curves, confusion matrix)
 - Live inference with simulated stream (WebSocket)
-- Export: pipeline JSON, model .pt, Python inference script
+- Export: pipeline JSON, model .pt, Python inference script, ONNX, microcontroller ZIP
 - UI polish: step reordering, session rename, sidebar progress dots
 
-**Critical known issue from Part 1 (fixed in Part 2 Session 1):**
-The exported Python inference script does NOT apply preprocessing. It expects a pre-processed array. **Fixed in P2-S1** — the script now embeds the full pipeline and exposes `predict(raw_window)`.
+---
+
+## Part 2 — What Gets Built
 
 ---
 
-## Part 2 — What Gets Built Next
+### P2-S2 — Inference Page: Source Toggle + Output System
 
-### Part 2 Session 1 — Live Data + Full Export ✅ Done
+**Goal:** Complete the inference page so predictions are actually useful for real projects. Three input sources, two output destinations.
 
-**Goal:** Make the exported scripts truly end-to-end, add real hardware streaming, add ONNX and microcontroller export.
+#### Input Source Toggle
 
-#### Fix 1: Inference Script Must Embed Preprocessing
+Three modes on InferencePage, shown as a toggle at the top:
 
-This is the most important fix. Update `backend/core/export.py`:
+**1. Simulated** (already works)
+Generates synthetic EEG sine waves. Always available. Use for testing without hardware.
 
-The generated `inference.py` script must:
-1. Embed the full pipeline config at the top as an editable constant
-2. Implement all preprocessing steps inline (no Neutrol import) — bandpass, notch, reref, normalize, sliding window as pure functions
-3. Expose `predict(raw_window: np.ndarray) -> tuple[str, float]` — takes raw EEG, returns (class_label, confidence)
-4. Have a queue-based threading live loop at the bottom:
+**2. File Playback** (new)
+User selects any loaded DataSession. The backend replays the session's signal array in real time — it slices windows sequentially with a configurable delay between them, sending each through the pipeline and model exactly as if it were live data. This lets anyone test the full inference pipeline without hardware.
+
+Backend: add `playback` mode to the existing `/ws/stream-run` WebSocket endpoint. Client sends:
+```json
+{ "type": "start", "mode": "playback", "session_id": "...", "job_id": "...", "delay_ms": 200 }
+```
+Backend slices windows from the session's signal array sequentially, applies pipeline, runs model, streams predictions. When signal ends, sends `{ "type": "done" }`.
+
+**3. Hardware** (BrainFlow — backend exists, UI was not built)
+Connects to a real EEG device. Uses the existing `/ws/hardware` endpoint and `/hardware/connect` + `/hardware/disconnect` endpoints already built in P2-S1.
+
+UI for hardware mode:
+- Board selector dropdown (populated from `GET /api/inference/hardware/boards`)
+- Serial port text input (shown only if board `needs_serial` is true)
+- IP address input (shown only if board `needs_ip` is true)
+- Connect / Disconnect button
+- Status badge: 🟢 Connected / ⚫ Disconnected
+- Once connected, Start Inference button activates
+
+All three modes send predictions in the same WebSocket message format:
+```json
+{ "label": "left", "confidence": 0.87, "timestamp": 1234567890 }
+```
+So the prediction display UI (badge, confidence bars, history ribbon) is shared across all three modes.
+
+#### Output Destination System
+
+After every prediction, Neutrol can dispatch it to an external destination. This is how the prediction leaves Neutrol and reaches the user's robot, prosthetic, script, or device.
+
+Two output destinations (can be active simultaneously):
+
+**Output 1 — WebSocket Server**
+Neutrol starts a WebSocket server on a configurable port (default 8765). External code connects to this server as a client and receives predictions as JSON. This works for: Python scripts, Node.js, any language that supports WebSocket.
+
+Why WebSocket and not HTTP: robots and prosthetics need continuous real-time predictions. HTTP requires a new request for every prediction. WebSocket is a persistent connection — predictions arrive instantly as they're generated with no request overhead.
+
+Example external Python client (shown in the UI as a code snippet):
+```python
+import asyncio, websockets, json
+
+async def receive_predictions():
+    async with websockets.connect("ws://localhost:8765") as ws:
+        async for message in ws:
+            data = json.loads(message)
+            print(f"Label: {data['label']}, Confidence: {data['confidence']:.1%}")
+            # Your control code here
+
+asyncio.run(receive_predictions())
+```
+
+**Output 2 — Serial Port**
+Sends a configurable string over a serial/COM port after each prediction. This is the most direct way to control an Arduino, ESP32, or any microcontroller reading serial.
+
+User configures:
+- Port name (e.g. COM3, /dev/ttyUSB0) — dropdown populated from `GET /api/inference/output/serial-ports`
+- Baud rate (default 9600)
+- Per-class output string — what gets sent when each class is predicted:
+  - "rest" → "0\n"
+  - "left" → "L\n"
+  - "right" → "R\n"
+  These strings are fully editable by the user.
+
+Uses `pyserial` library on the backend.
+
+#### Action Mapper UI
+
+On the InferencePage, below the source selector, show an **Output** section with two cards:
+
+**WebSocket Output card:**
+- Toggle: Enabled / Disabled
+- Port number input (default 8765)
+- Status: "Server running on ws://localhost:8765" or "Stopped"
+- Code snippet tab showing the Python client example above
+
+**Serial Output card:**
+- Toggle: Enabled / Disabled
+- Port dropdown (from serial-ports endpoint)
+- Baud rate dropdown (9600, 115200, 57600)
+- Per-class string table — editable rows, one per class label:
+  | Class | Send string |
+  |---|---|
+  | rest | 0\n |
+  | left | L\n |
+  | right | R\n |
+
+Backend: `OutputDispatcher` class in `backend/core/inference.py`:
 
 ```python
-# ============================================================
-# NEUTROL INFERENCE SCRIPT — v2 (with preprocessing)
-# Generated by Neutrol. Edit the CONFIG section to customize.
-# ============================================================
-
-# ── SECTION 1: CONFIG (safe to edit) ────────────────────────
-SAMPLE_RATE    = 256          # Hz — must match your EEG device
-WINDOW_SEC     = 1.0          # seconds per prediction
-CHANNELS       = ["C3","C4"]  # channels used — must match training
-MODEL_PATH     = "model.pt"
-CLASSES        = ["rest","left","right"]
-
-# ── SECTION 2: PREPROCESSING (auto-generated from your pipeline)
-# Only change if you retrain with different preprocessing.
-PIPELINE_STEPS = [
-    {"step": "notch",    "freq_hz": 60.0},
-    {"step": "bandpass", "low_hz": 1.0, "high_hz": 40.0},
-    {"step": "normalize","method": "zscore"},
-]
-
-# ── SECTION 3: YOUR OUTPUT CODE (edit this) ─────────────────
-def on_prediction(label: str, confidence: float):
-    """Called every time a prediction is made. Put your code here."""
-    print(f"Prediction: {label} ({confidence:.1%})")
-    # if label == "left": control_robot_left()
-
-# ── SECTION 4: PREPROCESSING FUNCTIONS (do not edit) ────────
-# [all filter functions implemented inline here]
-
-# ── SECTION 5: INFERENCE LOOP (do not edit) ─────────────────
-# Queue-based: one thread reads EEG, another runs inference
-# This prevents dropped samples during processing
-```
-
-The filter coefficients for Section 4 are computed by `export.py` from the saved pipeline config using SciPy — same `butter()` and `iirnotch()` calls, coefficients extracted as float arrays and written as Python constants. This guarantees the exported script uses mathematically identical preprocessing to training.
-
-#### Fix 2: ONNX Export
-
-Add to `backend/core/export.py`:
-
-```python
-def export_onnx(job_id: str, export_path: str) -> str:
+class OutputDispatcher:
     """
-    Export trained model to ONNX format.
-    ONNX runs on onnxruntime — lighter than PyTorch, works on Raspberry Pi ARM.
-    Returns path to the .onnx file.
+    Receives predictions and dispatches them to configured output destinations.
+    Called after every prediction during inference, regardless of source.
     """
+    
+    def __init__(self):
+        self.ws_server = None         # asyncio WebSocket server instance
+        self.ws_clients = set()       # connected external clients
+        self.serial_conn = None       # pyserial Serial instance
+        self.serial_map = {}          # label → string to send
+        self.ws_port = 8765
+        self.enabled_ws = False
+        self.enabled_serial = False
+    
+    async def start_ws_server(self, port: int) -> None
+    async def stop_ws_server(self) -> None
+    def start_serial(self, port: str, baud: int, label_map: dict) -> None
+    def stop_serial(self) -> None
+    async def dispatch(self, label: str, confidence: float) -> None
+        # Sends to all connected WS clients AND serial port if enabled
 ```
 
-Process:
-1. Load model from checkpoint using `build_model(config)`
-2. Set to `model.eval()` — required before export
-3. Create dummy input tensor of correct shape: `(1, 1, n_channels, n_samples)`
-4. Call `torch.onnx.export(model, dummy_input, path, opset_version=12, input_names=['input'], output_names=['output'])`
-5. Return the .onnx file path
+Add `output_dispatcher: OutputDispatcher` to SessionStore (one instance, shared).
 
-Also generate `inference_onnx.py` — same structure as the Python script above but uses `onnxruntime` instead of PyTorch:
-```python
-import onnxruntime as ort
-session = ort.InferenceSession("model.onnx")
-# preprocessing is identical — same embedded pipeline functions
-output = session.run(None, {"input": window_array})[0]
-```
+New API endpoints in `inference_routes.py`:
+- `GET /api/inference/output/serial-ports` — returns list of available COM/serial ports using `serial.tools.list_ports`
+- `POST /api/inference/output/config` — body: `{ ws_enabled, ws_port, serial_enabled, serial_port, serial_baud, serial_map }` — configures the dispatcher
+- `GET /api/inference/output/config` — returns current output config and status
 
-Add to `backend/api/export_routes.py`:
-- `GET /api/export/onnx/{job_id}` → returns .onnx file (FileResponse)
-- `GET /api/export/onnx-script/{job_id}` → returns onnx inference script (PlainTextResponse)
+The inference WebSocket handlers (`/ws/stream-run` and `/ws/hardware`) call `store.output_dispatcher.dispatch(label, confidence)` after every prediction.
 
-#### Fix 3: Microcontroller Export (ESP32-S3, STM32)
+---
 
-Targets: ESP32-S3, STM32 F4/H7, Arduino Nano 33 BLE Sense. NOT Arduino Uno (insufficient RAM).
+### P2-S3 — Training Improvements
 
-Conversion chain: `PyTorch → ONNX → TFLite → C array (.h file)`
+**Goal:** Fine-tuning, model history, comparison, and data augmentation.
 
-Add to `backend/core/export.py`:
+#### Fine-Tuning / Incremental Training
 
-```python
-def export_microcontroller(job_id: str, export_dir: str) -> str:
-    """
-    Generate a ZIP containing everything needed for ESP32-S3 / STM32 deployment.
-    Requires: tensorflow and onnx2tf installed (flagged as optional dependency).
-    Returns path to the .zip file.
-    """
-```
+What it is: load an existing trained model's weights, then continue training on a new dataset without resetting those weights. The model keeps what it learned and improves further.
 
-The ZIP contains three files:
+When it makes sense:
+- Train on Person A's data, then fine-tune on Person B's small dataset → better cross-subject performance
+- Train on Session 1, fine-tune on Session 2 → adapts to signal drift over time
+- Train on one task, fine-tune on a related task → transfer learning
 
-**`model_data.h`** — model weights as a C array:
-```c
-// Auto-generated by Neutrol. Do not edit.
-// Model: my_model | Classes: rest, left, right | Accuracy: 87.3%
-alignas(8) const unsigned char neutrol_model_data[] = { 0x18, 0x00, ... };
-const unsigned int neutrol_model_data_len = 12345;
-```
+Constraint: the model architecture and number of output classes must be identical between the original training run and the fine-tuning run. If classes don't match, return a clear error.
 
-**`neutrol_inference.cpp`** — TFLite Micro inference template:
-```cpp
-// ============================================================
-// NEUTROL — Microcontroller Inference Template
-// Tested on: ESP32-S3, STM32 H7, Arduino Nano 33 BLE Sense
-// ============================================================
+Backend changes to `backend/core/trainer.py`:
 
-// ── SECTION 1: CONFIG (edit these) ──────────────────────────
-#define SAMPLE_RATE      256
-#define WINDOW_SAMPLES   256     // SAMPLE_RATE * WINDOW_SEC
-#define N_CHANNELS       8
-#define N_CLASSES        3
-const char* CLASS_LABELS[] = {"rest", "left", "right"};
+Add optional parameter `finetune_from_job_id: str = None` to `run_training()`. When provided:
+1. Load the checkpoint for `finetune_from_job_id` from the exports folder
+2. Rebuild the model using `build_model(config)` — same architecture
+3. Load the saved weights: `model.load_state_dict(checkpoint['model_state_dict'])`
+4. Validate that the class lists match — raise clear error if they don't
+5. Continue the normal training loop with these pre-loaded weights instead of random init
+6. Save the new checkpoint as a new job_id (does not overwrite the original)
+7. In the checkpoint, store `finetuned_from: job_id` so the history is traceable
 
-// ── SECTION 2: FILTER COEFFICIENTS (auto-generated) ─────────
-// Bandpass 1-40Hz, Butterworth order 4, at 256Hz
-// These match exactly what your model was trained on.
-static const float BANDPASS_SOS[2][6] = {
-    {0.0007f, 0.0014f, 0.0007f, 1.0f, -1.9259f, 0.9287f},
-    {0.0007f, 0.0014f, 0.0007f, 1.0f, -1.7834f, 0.8108f}
-};
+New API endpoint in `train_routes.py`:
 
-// ── SECTION 3: YOUR OUTPUT CODE (edit this) ─────────────────
-void on_prediction(int class_index, float confidence) {
-    Serial.printf("Prediction: %s (%.1f%%)\n",
-                  CLASS_LABELS[class_index], confidence * 100);
-    // Add your GPIO/motor/servo control here:
-    // if (class_index == 1) digitalWrite(MOTOR_LEFT, HIGH);
-}
+`POST /api/train/finetune`
+- Body: `{ "base_job_id": str, "run_id": str, "model_config": ModelConfig dict }`
+- `base_job_id`: the existing trained model to continue from
+- `run_id`: the new labeled data to train on
+- `model_config`: must match the base model's architecture exactly
+- Validates class match before starting
+- Returns `{ job_id }` — new job that can be polled with existing status endpoint
 
-// ── SECTION 4: TFLITE + PREPROCESSING (do not edit) ─────────
-#include "model_data.h"
-#include <TensorFlowLite.h>
-// [TFLite Micro boilerplate + C filter implementations]
-```
+**UI changes to TrainPage:**
+- Add a "Training Mode" toggle at the top: **Train from scratch** | **Fine-tune existing model**
+- In fine-tune mode: show a "Base Model" dropdown listing all trained models
+- Show a validation message: "✓ Compatible — same architecture and classes" or "✗ Class mismatch: base has [rest, left] but current labels have [rest, left, right]"
+- Start button changes to "Fine-tune" in this mode
 
-**`README_microcontroller.md`** — step-by-step instructions:
-- Install Arduino IDE or ESP-IDF
-- Install TensorFlow Lite Micro library
-- Copy both files into your sketch folder
-- Connect your EEG hardware to the ADC pins
-- Upload and open Serial Monitor
+#### Model History View
 
-The C filter coefficients in Section 2 are computed by `export.py` using `scipy.signal.butter()` and extracted as float arrays — same math as Python, different language.
+A new section on TrainPage (or a separate tab) that shows all training runs grouped by model name.
 
-**Important**: The microcontroller export endpoint must check if `tensorflow` is installed and return a clear error if not:
+For each model name, show a table of all its training runs:
+| Run | Date | Dataset | Epochs | Val Accuracy | Fine-tuned from |
+|---|---|---|---|---|---|
+| Run 1 | 2025-03-01 | session_abc | 50 | 72.3% | — |
+| Run 2 | 2025-03-03 | session_def | 30 | 81.1% | Run 1 |
+| Run 3 | 2025-03-05 | session_ghi | 20 | 87.4% | Run 2 |
+
+Also show a small line chart of accuracy over runs — visually shows improvement.
+
+Backend: `GET /api/train/history/{model_name}` — scans the exports folder for all `.pt` checkpoints whose `model_name` field matches, returns them sorted by date with their metadata.
+
+#### Model Comparison Table
+
+A "Compare Models" button on TrainPage (or ExportPage) that opens a side-by-side comparison of selected models.
+
+Shows per model: accuracy, precision, recall, F1 score per class.
+
+Example:
+| Metric | Model A | Model B | Model C |
+|---|---|---|---|
+| Overall Accuracy | 72.3% | 81.1% | 87.4% |
+| rest precision | 0.71 | 0.82 | 0.89 |
+| left precision | 0.68 | 0.79 | 0.85 |
+| right precision | 0.78 | 0.82 | 0.88 |
+
+No new backend endpoint needed — uses existing `GET /api/train/{job_id}/results` for each selected model.
+
+#### Data Augmentation
+
+On the TrainPage, add an "Augmentation" section (collapsible, off by default).
+
+Three augmentation options with toggles:
+1. **Gaussian Noise** — adds small random noise to each window. Strength parameter (default 0.05 = 5% of signal std). Makes model robust to signal variation.
+2. **Time Shift** — shifts each window slightly left or right in time (±10% of window length). Makes model robust to temporal misalignment.
+3. **Channel Dropout** — randomly zeroes one channel per window during training (not during validation). Makes model robust to electrode artifacts.
+
+When any augmentation is enabled, the training data is expanded: each window becomes N copies with different augmentations applied. Default multiplier: 3x (each window generates 2 augmented copies + original).
+
+Backend: add `augmentation_config` to the training start request body:
 ```json
 {
-  "success": false,
-  "error": "Microcontroller export requires TensorFlow. Run: pip install tensorflow onnx onnx2tf"
+  "augmentation": {
+    "gaussian_noise": { "enabled": true, "strength": 0.05 },
+    "time_shift": { "enabled": true, "max_shift_ratio": 0.1 },
+    "channel_dropout": { "enabled": false },
+    "multiplier": 3
+  }
 }
 ```
 
-Add to `export_routes.py`:
-- `GET /api/export/microcontroller/{job_id}` → returns .zip (FileResponse)
-
-#### Fix 4: BrainFlow Hardware Streaming
-
-BrainFlow is a Python library that provides a unified API for 30+ EEG devices (OpenBCI Cyton/Ganglion, Muse, PiEEG, etc.). One API, any device.
-
-Add to `backend/core/inference.py`:
-
-```python
-class HardwareStreamer:
-    """
-    Manages a live EEG hardware connection via BrainFlow.
-    One instance stored in SessionStore.hardware_streamer.
-    """
-    def connect(self, board_id: int, serial_port: str = None) -> DataSession
-    def start_stream(self) -> None
-    def get_window(self, n_samples: int) -> np.ndarray  # returns (n_channels, n_samples)
-    def stop_stream(self) -> None
-    def disconnect(self) -> None
-```
-
-Add `hardware_streamer: HardwareStreamer | None = None` to SessionStore.
-
-Add to `backend/api/inference_routes.py`:
-- `GET /api/inference/hardware/boards` — returns dict of common board IDs and names
-- `POST /api/inference/hardware/connect` — body: `{board_id, serial_port?, ip_address?}` → connects and returns session metadata
-- `POST /api/inference/hardware/disconnect` — disconnects cleanly
-- `WS /ws/inference/hardware` — WebSocket that reads from BrainFlow, applies pipeline, runs model, streams predictions
-
-The hardware WebSocket follows the same message format as the existing simulated stream WebSocket so the frontend can use the same `useWebSocket` hook.
-
-Update `InferencePage.jsx`:
-- Add a "Source" toggle at the top: **Simulated** | **Hardware**
-- Hardware mode shows: Board selector dropdown, Serial port input (optional), Connect/Disconnect button
-- Once connected, Start Inference works the same as simulated mode
-- Show hardware status badge: Connected (green) / Disconnected (grey)
-
-#### UI Updates for Export Page
-
-Update `ExportPage.jsx` to show four export cards:
-
-| Card | Files | When to use |
-|---|---|---|
-| **Python Script** | `inference.py` | Laptop, desktop, Raspberry Pi 4/5 |
-| **ONNX Package** | `model.onnx` + `inference_onnx.py` | Raspberry Pi 3/Zero, edge devices |
-| **Microcontroller** | ZIP with .h + .cpp + README | ESP32-S3, STM32, Nano 33 BLE |
-| **Config JSON** | `pipeline_config.json` | Reference / manual use |
-
-The Microcontroller card shows a warning badge: "Requires TensorFlow installed on your machine to generate."
+Implement `augment_windows(windows, labels, config)` in `trainer.py` — applies augmentations and returns expanded windows and labels lists.
 
 ---
 
-## Part 2 Session 1 — What Was Actually Built ✅
+### P2-S4 — PreprocessPage Dashboard View
 
-### Fix 1: Inference Script Embeds Preprocessing
+**Goal:** Let users see all four signal analysis charts simultaneously in a 2×2 grid.
 
-**`backend/core/trainer.py`** — checkpoint save now includes `sample_rate` and `pipeline_config`:
-```python
-torch.save({
-    ...,
-    "sample_rate":     sample_rate,      # from session object
-    "pipeline_config": pipeline_config,  # from pipeline run entry
-}, model_path)
+Add a **View Mode** toggle at the top right of the analysis section:
+- **📊 Tabs** (current behavior — one chart at a time, full width)
+- **⊞ Dashboard** (all four charts in a 2×2 grid, each at half-size)
+
+In dashboard mode, all four charts render simultaneously:
 ```
-Without these fields, the inference script has no pipeline to embed. Old checkpoints (pre-P2-S1) fall back to "no preprocessing recorded" gracefully.
-
-**`backend/core/export.py`** — complete rewrite. Key design decisions:
-- **Programmatic builder** (string concatenation) instead of a single `.format()` template. This avoids double-bracing every `{}` in generated Python code, which made the old template fragile.
-- **Pre-computed filter coefficients**: `_compute_bandpass_sos()` calls `scipy.signal.butter()` and `_compute_notch_ba()` calls `scipy.signal.iirnotch()` at generation time. The coefficients are embedded as float constants in the script. At runtime, the script only needs `scipy.signal.sosfiltfilt`/`lfilter` — not filter design.
-- **`_MODEL_BUILDER_CODE`** string constant embeds the full model builder verbatim (same logic as `core/models.py`, no Neutrol import needed).
-- `generate_inference_script()` now reads `pipeline_config` and `sample_rate` from the checkpoint, builds `_apply_preprocessing()` with the right steps, and `predict(raw_window)` calls `_apply_preprocessing()` before the model.
-
-Four public functions in the new `export.py`:
-```
-generate_inference_script(job_id, checkpoint, model_name) → str
-export_onnx(job_id, model_path, export_dir) → str (path to .onnx)
-generate_onnx_script(job_id, checkpoint, model_name) → str
-export_microcontroller(job_id, model_path, export_dir) → str (path to .zip)
+┌─────────────────┬─────────────────┐
+│   Waveform      │   Frequency     │
+│   (Time)        │   (PSD)         │
+├─────────────────┼─────────────────┤
+│   Band Power    │   Spectrogram   │
+│   (Bar chart)   │   (Heatmap)     │
+└─────────────────┴─────────────────┘
 ```
 
-### Fix 2: ONNX Export
+Each chart in dashboard mode has a small "expand" button (⤢) that temporarily switches back to tab view for that specific chart at full width.
 
-`export_onnx()` in `export.py`:
-1. Load checkpoint, rebuild model with `build_model(config)`
-2. Materialize lazy modules with dummy forward pass (same pattern as inference loading)
-3. `torch.onnx.export()` with `opset_version=18` (PyTorch 2.11 generates opset 18 natively)
-4. `redirect_stdout` to suppress emoji-laden progress messages that crash on Windows cp1252 terminal
+The Before/After toggle and channel selector still work in dashboard mode — they apply to all four charts simultaneously.
 
-`generate_onnx_script()` produces the same 7-section structure as the PyTorch script but uses `onnxruntime.InferenceSession` instead of `torch.load`. Preprocessing is identical — same embedded coefficients.
+This is a **frontend-only change**. All four backend analysis endpoints already exist. The dashboard just calls all four at once instead of one at a time.
 
-New endpoints in `export_routes.py`:
-- `GET /api/export/onnx/{job_id}` → FileResponse `.onnx`
-- `GET /api/export/onnx-script/{job_id}` → PlainTextResponse `.py`
+Implementation note: The four API calls happen in parallel using `Promise.all()` — not sequentially — so the dashboard loads all charts at the same time.
 
-### Fix 3: Microcontroller Export
+---
 
-`export_microcontroller()` in `export.py`:
-- Conversion chain: PyTorch → ONNX → TFLite (via `onnx2tf`) → C hex array
-- Raises `ImportError` immediately if `tensorflow` or `onnx2tf` are not installed — caught in `export_routes.py` and returned as HTTP 422 with a clear `pip install` message
-- ZIP contains `model_data.h` (TFLite C array), `neutrol_inference.cpp` (TFLite Micro + Arduino template with embedded SOS filter coefficients), `README_microcontroller.md`
-- C filter coefficients are generated by the same `scipy.signal.butter()` calls, formatted as C float array literals
+### P2-S5 — Tauri Desktop App Conversion
 
-New endpoint: `GET /api/export/microcontroller/{job_id}` → FileResponse `.zip`
+**Goal:** Package Neutrol as an installable desktop app for Windows, macOS, and Linux.
 
-### Fix 4: BrainFlow Hardware Streaming
+**Why Tauri over Electron:** Tauri uses the OS's native webview (no bundled Chromium) making the installer ~5MB instead of ~150MB. The backend runs as a sidecar process.
 
-**`backend/core/inference.py`** — added `HardwareStreamer` class and `SUPPORTED_BOARDS` dict:
-```python
-SUPPORTED_BOARDS = {
-    "synthetic": -1,   # no hardware — for testing
-    "cyton":      0,   # OpenBCI Cyton 8ch 250Hz
-    "cyton_daisy": 2,  # OpenBCI Cyton+Daisy 16ch 125Hz
-    "ganglion":   1,   # OpenBCI Ganglion 4ch 200Hz
-    "muse_s":    39,   # Muse S 4ch 256Hz
-    "muse_2":    38,   # Muse 2 4ch 256Hz
-    "neurosity_notion": 13,
+Key decisions for Tauri conversion:
+1. The React frontend is already built — Tauri wraps it with no code changes
+2. The FastAPI backend gets packaged using PyInstaller into a standalone executable
+3. A Tauri "sidecar" config starts and stops the Python executable with the app
+4. `frontend/src/config.js` already centralizes the API URL — change `API_BASE_URL` to `http://127.0.0.1:8000` (127.0.0.1 instead of localhost avoids some OS-level DNS lookup delays)
+
+Files to create:
+- `src-tauri/` — Tauri project folder
+- `src-tauri/tauri.conf.json` — Tauri config (app name, window size, sidecar config)
+- `src-tauri/src/main.rs` — minimal Rust entry point (mostly boilerplate)
+- `build_backend.py` — PyInstaller script to package the Python backend
+- `package_app.sh` / `package_app.bat` — one-command build script
+
+Sidecar approach: in `tauri.conf.json`, register the packaged Python executable as a sidecar. Tauri starts it when the app opens and kills it when the app closes.
+
+```json
+{
+  "tauri": {
+    "bundle": {
+      "externalBin": ["binaries/neutrol-backend"]
+    }
+  }
 }
 ```
-`HardwareStreamer` wraps `BoardShim`:
-- `start()` calls `prepare_session()` + `start_stream()`
-- `get_window(n_samples)` calls `get_board_data(n_samples)` and slices EEG channels only
-- Returns `None` if fewer than `n_samples` have accumulated (caller skips the cycle)
-- `stop()` calls `stop_stream()` + `release_session()`
-- `list_boards()` static method reads metadata from BrainFlow without connecting
 
-**`backend/sessions/session_store.py`** — added `hardware_streamer = None` field to singleton.
-
-**`backend/api/inference_routes.py`** — four new endpoints:
-- `GET /hardware/boards` — returns board list with `brainflow_available` flag
-- `POST /hardware/connect` — body `{board_name, serial_port?, ip_address?}`, starts streamer
-- `POST /hardware/disconnect` — stops and clears `store.hardware_streamer`
-- `WS /ws/hardware` — same protocol as `/ws/stream-run` (ready → prediction loop → done) but polls live hardware buffer instead of stored windows. Client sends `{type: start, job_id, n_samples, delay_ms}` and can send `{type: stop}` at any time.
-
-### Fix 5: Export Page Four Cards
-
-**`frontend/src/pages/ExportPage.jsx`** — redesigned `ModelCard` to show four `ExportFormatCard` tiles per model:
-
-| Tile | Files | Color |
-|---|---|---|
-| Python Script | `.pt` + `.py` | Purple |
-| ONNX Package | `.onnx` + `.py` | Blue |
-| Microcontroller | `.zip` | Green |
-| Pipeline Config | links to section below | Yellow |
-
-New components: `ExportFormatCard` (title, badge, description, download buttons), extended `COLOR_MAP` with `yellow` and `gray`.
-
-### Known Issues / Gotchas from P2-S1
-
-- **Old checkpoints have no pipeline_config** — models trained before P2-S1 will show "No preprocessing recorded" in the generated script. Retrain with the new trainer to get embedded preprocessing.
-- **Microcontroller export requires optional deps** — `tensorflow`, `onnx2tf` not in `requirements.txt` (too large, optional). Returns HTTP 422 with install instructions if missing.
-- **BrainFlow synthetic board** — 16 channels at 250 Hz; use it to test the hardware WebSocket UI without real hardware.
-- **onnxscript** — required by `torch.onnx.export` in PyTorch 2.x but not always auto-installed. Added to `requirements.txt` explicitly.
-- **InferencePage Source toggle not yet built** — the hardware WebSocket endpoint exists and works, but the InferencePage UI still only shows simulated mode. Adding the Source toggle (Simulated | Hardware) is deferred to P2-S2.
+The Python backend is packaged with PyInstaller:
+```bash
+pyinstaller --onefile --name neutrol-backend backend/main.py
+```
 
 ---
 
-## Part 2 Roadmap
+## Part 2 Session Roadmap
 
 | Session | Status | What gets built |
 |---|---|---|
-| **P2-S1** | ✅ Done | Inference script preprocessing + ONNX export + microcontroller export + BrainFlow hardware streaming |
-| **P2-S2** | **Current** | Tauri desktop app conversion |
-| P2-S3 | Upcoming | TBD based on user feedback |
+| P2-S1 | ✅ Done | Inference script preprocessing + ONNX + microcontroller export + BrainFlow backend |
+| **P2-S2** | **Next** | InferencePage source toggle (Simulated/File Playback/Hardware) + Output system (WebSocket server + Serial port) + Action mapper UI |
+| P2-S3 | Upcoming | Fine-tuning training + model history + model comparison + data augmentation |
+| P2-S4 | Upcoming | PreprocessPage dashboard multi-graph view |
+| P2-S5 | Upcoming | Tauri desktop app conversion |
 
 ---
 
 ## Known Issues
 
-- **InferencePage Source toggle missing** — hardware WebSocket endpoint works but the UI Source toggle (Simulated | Hardware) was not built in P2-S1; deferred to P2-S2
-- **Old .pt checkpoints have no pipeline_config** — models trained before P2-S1 get "No preprocessing recorded" in the generated script; retrain to fix
+- **InferencePage Source toggle missing** — UI not built yet; hardware WebSocket endpoint works
+- **Old .pt checkpoints missing pipeline_config** — models trained before P2-S1 get "No preprocessing recorded" in generated script; retrain to fix
 - **Microcontroller export optional deps** — `tensorflow` + `onnx2tf` not in requirements.txt; returns HTTP 422 with install message if missing
-- **Session nicknames reset on refresh** — stored in Zustand only, intentional for now
+- **Session nicknames reset on refresh** — Zustand only, intentional for now
 - **ICA step has no progress indicator** — long recordings can take minutes silently
 
 ---

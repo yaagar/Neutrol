@@ -34,7 +34,9 @@
       "Bash(python:*)",
       "Bash(tasklist /FI 'PID eq 49076')",
       "Bash(gh repo:*)",
-      "Bash(\"C:\\\\Users\\\\yasha\\\\OneDrive\\\\Documents\\\\Programming\\\\Python\\\\Neutrol\\\\.gitignore\":*)"
+      "Bash(\"C:\\\\Users\\\\yasha\\\\OneDrive\\\\Documents\\\\Programming\\\\Python\\\\Neutrol\\\\.gitignore\":*)",
+      "Bash(source ../venv/Scripts/activate)",
+      "Bash(pip install:*)"
     ]
   }
 }
