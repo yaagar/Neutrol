@@ -467,7 +467,8 @@ async def start_finetune(request: FinetuneRequest) -> JSONResponse:
             ),
         )
 
-    current_classes = sorted(set(lw.label for lw in labeled_windows))
+    # Exclude 'unknown' — same filter applied when training from scratch
+    current_classes = sorted(set(lw.label for lw in labeled_windows if lw.label != 'unknown'))
 
     # Check class compatibility up front so the frontend gets instant feedback
     # instead of waiting for the thread to start and fail.

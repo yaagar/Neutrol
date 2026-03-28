@@ -62,6 +62,12 @@ export default function LabelPage() {
   const [saving, setSaving]           = useState(false)
   const [saveResult, setSaveResult]   = useState(null)   // {success, message}
 
+  // --- Class manager state ---
+  // confirmRemoveClass holds the class the user clicked "Remove" on.
+  // We show an inline confirmation before actually deleting.
+  const [confirmRemoveClass, setConfirmRemoveClass] = useState(null)  // string | null
+  const [removing, setRemoving]               = useState(false)
+
   // --- Event file auto-labeling state ---
   const [eventFile, setEventFile]             = useState(null)       // File object from input
   const [eventUploading, setEventUploading]   = useState(false)
@@ -297,6 +303,69 @@ export default function LabelPage() {
       setSaveResult({ success: false, message: 'Could not reach the backend.' })
     } finally {
       setSaving(false)
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Class removal — filter one class out of local state and re-save
+  //
+  // We work on the local `labels` object (windowIndex → label) rather than
+  // adding a new backend endpoint. Filtering here and calling the existing
+  // save endpoint (which always overwrites the full set) keeps things simple
+  // and consistent. This follows the MNE-Python pattern: keep raw data intact,
+  // filter labels at the labeling stage.
+  // -------------------------------------------------------------------------
+
+  async function removeClassAndSave(labelToRemove) {
+    setRemoving(true)
+    setConfirmRemoveClass(null)
+    setSaveResult(null)
+
+    // Build new labels map without the removed class
+    const newLabels = Object.fromEntries(
+      Object.entries(labels).filter(([, l]) => l !== labelToRemove)
+    )
+    setLabels(newLabels)
+
+    // Re-save immediately so the backend stays in sync.
+    // We build the payload manually here (same logic as saveLabels) because
+    // React state updates are async — newLabels is available synchronously.
+    if (!activeRun) { setRemoving(false); return }
+
+    const labelsPayload = Object.entries(newLabels).map(([idxStr, label]) => {
+      const idx = parseInt(idxStr)
+      const windowSamples = activeRun.window_shape[1]
+      const approxStartSec = parseFloat(
+        (idx * windowSamples * 0.5 / (windowData?.sample_rate || 256)).toFixed(3)
+      )
+      return { window_index: idx, label, start_time_sec: approxStartSec }
+    })
+
+    try {
+      const res  = await fetch(`${API}/api/labels/save`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          session_id: currentSession.session_id,
+          run_id:     activeRun.run_id,
+          labels:     labelsPayload,
+        }),
+      })
+      const json = await res.json()
+      if (json.success) {
+        const remaining = Object.values(json.data.label_counts)
+          .reduce((s, c) => s + c, 0)
+        setSaveResult({
+          success: true,
+          message: `Removed all "${labelToRemove}" windows. ${remaining} labels remaining.`,
+        })
+      } else {
+        setSaveResult({ success: false, message: json.error || 'Save failed after removal.' })
+      }
+    } catch {
+      setSaveResult({ success: false, message: 'Could not reach the backend.' })
+    } finally {
+      setRemoving(false)
     }
   }
 
@@ -672,28 +741,69 @@ export default function LabelPage() {
       </div>
 
       {/* ---------------------------------------------------------------- */}
-      {/* Label summary + save                                              */}
+      {/* Class Manager + save                                             */}
       {/* ---------------------------------------------------------------- */}
-      <div className="border-t border-gray-800 pt-6 flex items-center justify-between">
-        <div>
-          {/* Show a compact count per label class */}
-          <div className="flex flex-wrap gap-2">
-            {Object.entries(
-              Object.values(labels).reduce((acc, l) => {
-                acc[l] = (acc[l] || 0) + 1; return acc
-              }, {})
-            ).map(([label, count]) => (
-              <span key={label} className="text-xs bg-gray-800 border border-gray-700 text-gray-400 px-2 py-0.5 rounded-full">
-                {count}× {label}
-              </span>
-            ))}
-          </div>
-          {saveResult && (
-            <p className={`text-sm mt-2 ${saveResult.success ? 'text-green-400' : 'text-red-400'}`}>
-              {saveResult.message}
-            </p>
-          )}
-        </div>
+      <div className="border-t border-gray-800 pt-6">
+
+        {/* Class breakdown with per-class remove button */}
+        {Object.keys(labels).length > 0 && (() => {
+          // Compute class counts from local labels state
+          const classCounts = Object.values(labels).reduce((acc, l) => {
+            acc[l] = (acc[l] || 0) + 1; return acc
+          }, {})
+
+          return (
+            <div className="mb-4">
+              <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">Label Classes</p>
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(classCounts).map(([label, count]) => (
+                  <div key={label} className="flex items-center gap-1 bg-gray-800 border border-gray-700 rounded-lg px-2 py-1">
+                    <span className={`text-xs font-medium ${label === 'unknown' ? 'text-gray-500' : 'text-gray-200'}`}>
+                      {count}× {label}
+                    </span>
+
+                    {/* Remove button — shows inline confirm on first click */}
+                    {confirmRemoveClass === label ? (
+                      <>
+                        <span className="text-xs text-red-400 ml-1">Remove {count} windows?</span>
+                        <button
+                          onClick={() => removeClassAndSave(label)}
+                          disabled={removing}
+                          className="text-xs text-red-400 hover:text-red-300 font-medium px-1.5 py-0.5 rounded border border-red-700 hover:border-red-500 ml-1 transition-colors disabled:opacity-40"
+                        >
+                          {removing ? '…' : 'Confirm'}
+                        </button>
+                        <button
+                          onClick={() => setConfirmRemoveClass(null)}
+                          className="text-xs text-gray-500 hover:text-gray-300 px-1 transition-colors"
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmRemoveClass(label)}
+                        className="text-xs text-gray-600 hover:text-red-400 ml-1 transition-colors leading-none"
+                        title={`Remove all ${label} windows`}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <p className="text-xs text-gray-600 mt-1.5">
+                Click × next to a class to remove all its windows from this run. Useful before fine-tuning when class lists must match exactly.
+              </p>
+            </div>
+          )
+        })()}
+
+        {saveResult && (
+          <p className={`text-sm mb-3 ${saveResult.success ? 'text-green-400' : 'text-red-400'}`}>
+            {saveResult.message}
+          </p>
+        )}
 
         <button
           onClick={saveLabels}
