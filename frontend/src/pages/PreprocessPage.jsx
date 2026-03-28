@@ -118,6 +118,13 @@ export default function PreprocessPage() {
   const [analysisLoading, setAnalysisLoading]   = useState(false)
   const [analysisError, setAnalysisError]       = useState(null)
 
+  // Dashboard view mode — 'tabs' shows one chart at a time, 'dashboard' shows 2×2 grid
+  const [viewMode, setViewMode]     = useState('tabs')
+  // In dashboard mode, clicking ⤢ on a chart sets expandedChart to show it full-width
+  const [expandedChart, setExpandedChart] = useState(null)  // null | 'time' | 'frequency' | 'bandpower' | 'spectrogram'
+  // Per-chart loading flags for dashboard mode so each tile shows its own spinner
+  const [dashLoading, setDashLoading] = useState({ time: false, frequency: false, bandpower: false, spectrogram: false })
+
   // -------------------------------------------------------------------------
   // Load existing runs when session changes
   // -------------------------------------------------------------------------
@@ -278,17 +285,65 @@ export default function PreprocessPage() {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Dashboard mode: fetch all 4 charts in parallel with Promise.all
+  //
+  // Each chart fetch is a standalone async operation with its own per-tile
+  // loading flag. We fire them simultaneously so the dashboard fills in as
+  // each result arrives rather than waiting for all four sequentially.
+  // -------------------------------------------------------------------------
+  async function fetchAllDashboard() {
+    if (!currentSession) return
+
+    const body = {
+      psd:  { session_id: currentSession.session_id, run_id: showRaw ? null : (activeRunId || null) },
+      band: { session_id: currentSession.session_id, run_id: showRaw ? null : (activeRunId || null) },
+      spec: { session_id: currentSession.session_id, run_id: showRaw ? null : (activeRunId || null), channel_index: selectedChannel },
+    }
+
+    setDashLoading({ time: !waveformData, frequency: true, bandpower: true, spectrogram: true })
+    setAnalysisError(null)
+
+    await Promise.all([
+      // Time waveform — only reload if not yet loaded (preview is raw-only)
+      waveformData ? Promise.resolve() : loadWaveform().then(() => setDashLoading(p => ({ ...p, time: false }))),
+
+      fetch(`${API}/api/analysis/psd`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body.psd) })
+        .then(r => r.json())
+        .then(j => { if (j.success) setPsdData(j.data); else setAnalysisError(j.error) })
+        .catch(e => setAnalysisError(e.message))
+        .finally(() => setDashLoading(p => ({ ...p, frequency: false }))),
+
+      fetch(`${API}/api/analysis/bandpower`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body.band) })
+        .then(r => r.json())
+        .then(j => { if (j.success) setBandData(j.data); else setAnalysisError(j.error) })
+        .catch(e => setAnalysisError(e.message))
+        .finally(() => setDashLoading(p => ({ ...p, bandpower: false }))),
+
+      fetch(`${API}/api/analysis/spectrogram`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body.spec) })
+        .then(r => r.json())
+        .then(j => { if (j.success) setSpectrogramData(j.data); else setAnalysisError(j.error) })
+        .catch(e => setAnalysisError(e.message))
+        .finally(() => setDashLoading(p => ({ ...p, spectrogram: false }))),
+    ])
+  }
+
   // Fetch analysis data when tab changes (auto-load on first switch)
   useEffect(() => {
     if (!currentSession) return
+    if (viewMode === 'dashboard') {
+      fetchAllDashboard()
+      return
+    }
     if (activeTab === 'frequency' && !psdData) fetchPsd()
     if (activeTab === 'bandpower' && !bandData) fetchBandPower()
     if (activeTab === 'spectrogram' && !spectrogramData) fetchSpectrogram()
-  }, [activeTab, currentSession?.session_id])
+  }, [activeTab, currentSession?.session_id, viewMode])
 
   // Re-fetch when before/after or channel selection changes
   useEffect(() => {
     if (!currentSession) return
+    if (viewMode === 'dashboard') { fetchAllDashboard(); return }
     if (activeTab === 'frequency') fetchPsd()
     if (activeTab === 'bandpower') fetchBandPower()
     if (activeTab === 'spectrogram') fetchSpectrogram()
@@ -296,6 +351,7 @@ export default function PreprocessPage() {
 
   useEffect(() => {
     if (!currentSession) return
+    if (viewMode === 'dashboard') { fetchAllDashboard(); return }
     if (activeTab === 'spectrogram') fetchSpectrogram()
   }, [selectedChannel])
 
@@ -613,25 +669,50 @@ export default function PreprocessPage() {
 
         {/* Tab bar + controls */}
         <div className="flex items-center gap-3 mb-3 flex-wrap">
-          {/* Tab buttons */}
+
+          {/* View mode toggle — Tabs vs Dashboard */}
           <div className="flex bg-gray-800 rounded-lg p-0.5 gap-0.5">
-            {ANALYSIS_TABS.map(tab => (
-              <button
-                key={tab.id}
-                onClick={() => setPreprocessPageState({ activeTab: tab.id })}
-                className={`px-3 py-1 rounded text-sm font-medium transition ${
-                  activeTab === tab.id
-                    ? 'bg-blue-600 text-white'
-                    : 'text-gray-400 hover:text-gray-200'
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
+            <button
+              onClick={() => { setViewMode('tabs'); setExpandedChart(null) }}
+              className={`px-3 py-1 rounded text-xs font-medium transition ${
+                viewMode === 'tabs' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-gray-200'
+              }`}
+              title="One chart at a time"
+            >
+              ☰ Tabs
+            </button>
+            <button
+              onClick={() => { setViewMode('dashboard'); setExpandedChart(null); fetchAllDashboard() }}
+              className={`px-3 py-1 rounded text-xs font-medium transition ${
+                viewMode === 'dashboard' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-gray-200'
+              }`}
+              title="All four charts simultaneously"
+            >
+              ⊞ Dashboard
+            </button>
           </div>
 
-          {/* Before/After toggle (only if there's a pipeline run) */}
-          {hasRun && activeTab !== 'time' && (
+          {/* Tab buttons — only shown in tabs mode */}
+          {viewMode === 'tabs' && (
+            <div className="flex bg-gray-800 rounded-lg p-0.5 gap-0.5">
+              {ANALYSIS_TABS.map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => setPreprocessPageState({ activeTab: tab.id })}
+                  className={`px-3 py-1 rounded text-sm font-medium transition ${
+                    activeTab === tab.id
+                      ? 'bg-blue-600 text-white'
+                      : 'text-gray-400 hover:text-gray-200'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Before/After toggle — in tabs mode only for non-time tabs; in dashboard always */}
+          {hasRun && (viewMode === 'dashboard' || activeTab !== 'time') && (
             <div className="flex bg-gray-800 rounded-lg p-0.5 gap-0.5">
               <button
                 onClick={() => setShowRaw(true)}
@@ -652,8 +733,8 @@ export default function PreprocessPage() {
             </div>
           )}
 
-          {/* Channel selector (for Frequency and Spectrogram) */}
-          {(activeTab === 'frequency' || activeTab === 'spectrogram') && (
+          {/* Channel selector — in tabs mode for frequency/spectrogram; in dashboard always */}
+          {(viewMode === 'dashboard' || activeTab === 'frequency' || activeTab === 'spectrogram') && (
             <div className="flex items-center gap-1">
               <label className="text-xs text-gray-400">Channel:</label>
               <select
@@ -668,20 +749,20 @@ export default function PreprocessPage() {
             </div>
           )}
 
-          {/* Refresh button for analysis tabs */}
-          {activeTab !== 'time' && (
-            <button
-              onClick={() => {
-                if (activeTab === 'frequency')   fetchPsd()
-                if (activeTab === 'bandpower')   fetchBandPower()
-                if (activeTab === 'spectrogram') fetchSpectrogram()
-              }}
-              disabled={analysisLoading}
-              className="ml-auto text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 rounded px-3 py-1"
-            >
-              {analysisLoading ? 'Loading…' : 'Analyze'}
-            </button>
-          )}
+          {/* Refresh/Analyze button */}
+          <button
+            onClick={() => {
+              if (viewMode === 'dashboard') { fetchAllDashboard(); return }
+              if (activeTab === 'frequency')   fetchPsd()
+              if (activeTab === 'bandpower')   fetchBandPower()
+              if (activeTab === 'spectrogram') fetchSpectrogram()
+              if (activeTab === 'time')        loadWaveform()
+            }}
+            disabled={analysisLoading || Object.values(dashLoading).some(Boolean)}
+            className="ml-auto text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 rounded px-3 py-1"
+          >
+            {(analysisLoading || Object.values(dashLoading).some(Boolean)) ? 'Loading…' : 'Analyze'}
+          </button>
         </div>
 
         {/* Error banner */}
@@ -691,68 +772,167 @@ export default function PreprocessPage() {
           </div>
         )}
 
-        {/* Chart area */}
-        <div className="flex-1 bg-gray-800 rounded-lg p-4 overflow-auto">
-          {activeTab === 'time' && (
-            <div>
-              <p className="text-xs text-gray-400 mb-2">
-                Raw signal — {channelNames.length} channels · {currentSession.sample_rate} Hz
-              </p>
-              {waveformData ? (
-                <WaveformChart
-                  data={waveformData.points}
-                  channelNames={waveformData.channel_names}
-                />
-              ) : (
-                <p className="text-gray-500 text-sm text-center mt-8">Loading waveform…</p>
-              )}
-            </div>
-          )}
+        {/* Chart area — tabs mode */}
+        {viewMode === 'tabs' && (
+          <div className="flex-1 bg-gray-800 rounded-lg p-4 overflow-auto">
+            {activeTab === 'time' && (
+              <div>
+                <p className="text-xs text-gray-400 mb-2">
+                  Raw signal — {channelNames.length} channels · {currentSession.sample_rate} Hz
+                </p>
+                {waveformData ? (
+                  <WaveformChart data={waveformData.points} channelNames={waveformData.channel_names} />
+                ) : (
+                  <p className="text-gray-500 text-sm text-center mt-8">Loading waveform…</p>
+                )}
+              </div>
+            )}
+            {activeTab === 'frequency' && (
+              <div>
+                <p className="text-xs text-gray-400 mb-3">
+                  {showRaw ? 'Raw signal PSD' : 'Preprocessed signal PSD'} ·{' '}
+                  <span className="text-blue-400">{channelNames[selectedChannel]}</span> highlighted
+                </p>
+                {analysisLoading ? (
+                  <p className="text-gray-500 text-sm text-center mt-8">Computing PSD…</p>
+                ) : (
+                  <FrequencyChart data={psdData} title={showRaw ? 'Raw Signal — PSD' : 'Preprocessed Signal — PSD'} />
+                )}
+              </div>
+            )}
+            {activeTab === 'bandpower' && (
+              <div>
+                <p className="text-xs text-gray-400 mb-3">
+                  {showRaw ? 'Raw signal band power' : 'Preprocessed signal band power'}
+                </p>
+                {analysisLoading ? (
+                  <p className="text-gray-500 text-sm text-center mt-8">Computing band power…</p>
+                ) : (
+                  <BandPowerChart data={bandData} />
+                )}
+              </div>
+            )}
+            {activeTab === 'spectrogram' && (
+              <div>
+                <p className="text-xs text-gray-400 mb-3">
+                  {showRaw ? 'Raw signal' : 'Preprocessed signal'} ·{' '}
+                  channel {channelNames[selectedChannel] || selectedChannel}
+                </p>
+                {analysisLoading ? (
+                  <p className="text-gray-500 text-sm text-center mt-8">Computing spectrogram…</p>
+                ) : (
+                  <SpectrogramChart data={spectrogramData} />
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
-          {activeTab === 'frequency' && (
-            <div>
-              <p className="text-xs text-gray-400 mb-3">
-                {showRaw ? 'Raw signal PSD' : 'Preprocessed signal PSD'} ·{' '}
-                <span className="text-blue-400">{channelNames[selectedChannel]}</span> highlighted
-              </p>
-              {analysisLoading ? (
-                <p className="text-gray-500 text-sm text-center mt-8">Computing PSD…</p>
-              ) : (
-                <FrequencyChart
-                  data={psdData}
-                  title={showRaw ? 'Raw Signal — PSD' : 'Preprocessed Signal — PSD'}
-                />
-              )}
-            </div>
-          )}
-
-          {activeTab === 'bandpower' && (
-            <div>
-              <p className="text-xs text-gray-400 mb-3">
-                {showRaw ? 'Raw signal band power' : 'Preprocessed signal band power'}
-              </p>
-              {analysisLoading ? (
-                <p className="text-gray-500 text-sm text-center mt-8">Computing band power…</p>
-              ) : (
-                <BandPowerChart data={bandData} />
-              )}
-            </div>
-          )}
-
-          {activeTab === 'spectrogram' && (
-            <div>
-              <p className="text-xs text-gray-400 mb-3">
-                {showRaw ? 'Raw signal' : 'Preprocessed signal'} ·{' '}
-                channel {channelNames[selectedChannel] || selectedChannel}
-              </p>
-              {analysisLoading ? (
-                <p className="text-gray-500 text-sm text-center mt-8">Computing spectrogram…</p>
-              ) : (
-                <SpectrogramChart data={spectrogramData} />
-              )}
-            </div>
-          )}
-        </div>
+        {/* Chart area — dashboard mode (2×2 grid, all charts simultaneously) */}
+        {viewMode === 'dashboard' && (
+          <div className="flex-1 overflow-auto">
+            {/* When a chart is expanded in dashboard mode, show it full-width */}
+            {expandedChart ? (
+              <div className="bg-gray-800 rounded-lg p-4 h-full flex flex-col">
+                <div className="flex items-center gap-2 mb-3">
+                  <button
+                    onClick={() => setExpandedChart(null)}
+                    className="text-xs text-gray-400 hover:text-gray-200 flex items-center gap-1 transition-colors"
+                  >
+                    ← Back to Dashboard
+                  </button>
+                  <span className="text-xs text-gray-500 ml-2">
+                    {ANALYSIS_TABS.find(t => t.id === expandedChart)?.label}
+                  </span>
+                </div>
+                <div className="flex-1">
+                  {expandedChart === 'time' && (
+                    waveformData
+                      ? <WaveformChart data={waveformData.points} channelNames={waveformData.channel_names} />
+                      : <p className="text-gray-500 text-sm text-center mt-8">Loading waveform…</p>
+                  )}
+                  {expandedChart === 'frequency' && (
+                    dashLoading.frequency
+                      ? <p className="text-gray-500 text-sm text-center mt-8">Computing PSD…</p>
+                      : <FrequencyChart data={psdData} title={showRaw ? 'Raw — PSD' : 'Preprocessed — PSD'} />
+                  )}
+                  {expandedChart === 'bandpower' && (
+                    dashLoading.bandpower
+                      ? <p className="text-gray-500 text-sm text-center mt-8">Computing band power…</p>
+                      : <BandPowerChart data={bandData} />
+                  )}
+                  {expandedChart === 'spectrogram' && (
+                    dashLoading.spectrogram
+                      ? <p className="text-gray-500 text-sm text-center mt-8">Computing spectrogram…</p>
+                      : <SpectrogramChart data={spectrogramData} />
+                  )}
+                </div>
+              </div>
+            ) : (
+              /* 2×2 grid — all four charts simultaneously */
+              <div className="grid grid-cols-2 grid-rows-2 gap-2 h-full min-h-[480px]">
+                {[
+                  {
+                    id: 'time', label: 'Waveform',
+                    loading: dashLoading.time,
+                    content: waveformData
+                      ? <WaveformChart data={waveformData.points} channelNames={waveformData.channel_names} height={180} />
+                      : null,
+                    placeholder: 'Loading waveform…',
+                  },
+                  {
+                    id: 'frequency', label: 'Frequency (PSD)',
+                    loading: dashLoading.frequency,
+                    content: psdData
+                      ? <FrequencyChart data={psdData} title={showRaw ? 'Raw — PSD' : 'Preprocessed — PSD'} height={180} />
+                      : null,
+                    placeholder: 'Click Analyze to load…',
+                  },
+                  {
+                    id: 'bandpower', label: 'Band Power',
+                    loading: dashLoading.bandpower,
+                    content: bandData
+                      ? <BandPowerChart data={bandData} height={180} />
+                      : null,
+                    placeholder: 'Click Analyze to load…',
+                  },
+                  {
+                    id: 'spectrogram', label: 'Spectrogram',
+                    loading: dashLoading.spectrogram,
+                    content: spectrogramData
+                      ? <SpectrogramChart data={spectrogramData} height={180} />
+                      : null,
+                    placeholder: 'Click Analyze to load…',
+                  },
+                ].map(tile => (
+                  <div key={tile.id} className="bg-gray-800 rounded-lg p-3 flex flex-col overflow-hidden">
+                    {/* Tile header with expand button */}
+                    <div className="flex items-center justify-between mb-1.5 flex-shrink-0">
+                      <span className="text-xs font-medium text-gray-400">{tile.label}</span>
+                      <button
+                        onClick={() => setExpandedChart(tile.id)}
+                        title="Expand to full width"
+                        className="text-gray-600 hover:text-gray-300 text-xs leading-none transition-colors px-1"
+                      >
+                        ⤢
+                      </button>
+                    </div>
+                    {/* Chart */}
+                    <div className="flex-1 min-h-0">
+                      {tile.loading ? (
+                        <p className="text-gray-500 text-xs text-center mt-6">Loading…</p>
+                      ) : tile.content ? (
+                        tile.content
+                      ) : (
+                        <p className="text-gray-600 text-xs text-center mt-6">{tile.placeholder}</p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Status line */}
         <p className="text-xs text-gray-500 mt-2 text-right">
