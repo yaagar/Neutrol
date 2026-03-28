@@ -28,7 +28,13 @@ from core.models import (
     ACTIVATION_OPTIONS, LAYER_TYPES_SCHEMA,
     estimate_output_shape, validate_model_config,
 )
+import os
+
+import torch
+
 from core.trainer import run_training
+
+EXPORTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "exports")
 from sessions.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -60,15 +66,25 @@ def api_response(success: bool, data=None, error: str | None = None) -> dict:
 
 class StartTrainingRequest(BaseModel):
     """Body for POST /api/train/start."""
-    session_id:      str
-    training_config: dict        # ModelConfig JSON dict from CLAUDE.md
-    run_id:          str | None = None  # Which pipeline run to train on (keyed in labeled_data)
-    model_name:      str = ""    # Optional human-readable name for this trained model
+    session_id:           str
+    training_config:      dict        # ModelConfig JSON dict from CLAUDE.md
+    run_id:               str | None = None
+    model_name:           str        = ""
+    augmentation_config:  dict | None = None  # Optional augmentation settings
 
 
 class RenameModelRequest(BaseModel):
     """Body for PATCH /api/train/{job_id}/name."""
     model_name: str
+
+
+class FinetuneRequest(BaseModel):
+    """Body for POST /api/train/finetune."""
+    base_job_id:          str           # existing trained model to start from
+    session_id:           str
+    run_id:               str | None = None
+    model_name:           str        = ""
+    augmentation_config:  dict | None = None
 
 
 class ValidateConfigRequest(BaseModel):
@@ -239,17 +255,18 @@ async def start_training(request: StartTrainingRequest) -> JSONResponse:
     # handler can find it immediately (even before the first epoch completes)
     job_id = str(uuid.uuid4())
     store.training_jobs[job_id] = {
-        "job_id":        job_id,
-        "session_id":    request.session_id,
-        "run_id":        request.run_id,
-        "model_name":    request.model_name,
-        "model_config":  model_config,
-        "status":        "running",
-        "current_epoch": 0,
-        "updates":       [],    # list of progress dicts appended by trainer.py
-        "history":       [],    # copy of per-epoch metrics
-        "model_path":    None,
-        "started_at":    datetime.now(timezone.utc).isoformat(),
+        "job_id":         job_id,
+        "session_id":     request.session_id,
+        "run_id":         request.run_id,
+        "model_name":     request.model_name,
+        "model_config":   model_config,
+        "status":         "running",
+        "current_epoch":  0,
+        "updates":        [],    # list of progress dicts appended by trainer.py
+        "history":        [],    # copy of per-epoch metrics
+        "model_path":     None,
+        "started_at":     datetime.now(timezone.utc).isoformat(),
+        "finetuned_from": None,  # None = training from scratch
     }
 
     # Start training in a daemon thread.
@@ -259,7 +276,10 @@ async def start_training(request: StartTrainingRequest) -> JSONResponse:
     thread = threading.Thread(
         target=run_training,
         args=(job_id, request.session_id, model_config),
-        kwargs={"run_id": request.run_id},
+        kwargs={
+            "run_id":              request.run_id,
+            "augmentation_config": request.augmentation_config,
+        },
         daemon=True,
         name=f"train-{job_id[:8]}",
     )
@@ -382,6 +402,178 @@ async def rename_model(job_id: str, request: RenameModelRequest) -> JSONResponse
     return JSONResponse(
         status_code=200,
         content=api_response(True, data={"job_id": job_id, "model_name": job["model_name"]}),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/train/finetune — start a fine-tuning job
+# ---------------------------------------------------------------------------
+
+@router.post("/finetune")
+async def start_finetune(request: FinetuneRequest) -> JSONResponse:
+    """
+    Start training from an existing model's weights instead of random init.
+
+    Loads the base model checkpoint, validates that the current training data
+    has matching classes, then launches a normal training job with the base
+    weights pre-loaded. Returns a new job_id — the original model is unchanged.
+    """
+    # Validate base model exists
+    base_path = os.path.join(EXPORTS_DIR, f"{request.base_job_id}.pt")
+    if not os.path.exists(base_path):
+        return JSONResponse(
+            status_code=404,
+            content=api_response(
+                False,
+                error=f"Base model '{request.base_job_id}' not found. Train a model first.",
+            ),
+        )
+
+    # Load the base checkpoint to get its config + classes for validation
+    try:
+        base_ckpt = torch.load(base_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content=api_response(False, error=f"Could not load base model: {exc}"),
+        )
+
+    base_classes = base_ckpt.get("class_names", [])
+
+    # Validate session exists
+    if request.session_id not in store.sessions:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error=f"Session '{request.session_id}' not found."),
+        )
+
+    # Gather labeled windows for class-list validation
+    if request.run_id:
+        labeled_windows = store.labeled_data.get(request.run_id, [])
+    else:
+        labeled_windows = [
+            lw
+            for lw_list in store.labeled_data.values()
+            for lw in lw_list
+            if lw.session_id == request.session_id
+        ]
+
+    if not labeled_windows:
+        return JSONResponse(
+            status_code=400,
+            content=api_response(
+                False,
+                error="No labeled windows found for this session/run.",
+            ),
+        )
+
+    current_classes = sorted(set(lw.label for lw in labeled_windows))
+
+    # Check class compatibility up front so the frontend gets instant feedback
+    # instead of waiting for the thread to start and fail.
+    if sorted(base_classes) != sorted(current_classes):
+        return JSONResponse(
+            status_code=400,
+            content=api_response(
+                False,
+                error=(
+                    f"Class mismatch: base model has {base_classes} "
+                    f"but current labels have {current_classes}. "
+                    "Fine-tuning requires identical class lists."
+                ),
+            ),
+        )
+
+    # Re-use the base model's architecture config exactly
+    model_config = dict(base_ckpt.get("model_config", {}))
+    model_config.setdefault("learning_rate", 0.001)
+    model_config.setdefault("epochs",        20)
+    model_config.setdefault("batch_size",    32)
+    model_config["classes"] = base_classes
+
+    job_id = str(uuid.uuid4())
+    store.training_jobs[job_id] = {
+        "job_id":           job_id,
+        "session_id":       request.session_id,
+        "run_id":           request.run_id,
+        "model_name":       request.model_name,
+        "model_config":     model_config,
+        "status":           "running",
+        "current_epoch":    0,
+        "updates":          [],
+        "history":          [],
+        "model_path":       None,
+        "started_at":       datetime.now(timezone.utc).isoformat(),
+        "finetuned_from":   request.base_job_id,
+    }
+
+    thread = threading.Thread(
+        target=run_training,
+        args=(job_id, request.session_id, model_config),
+        kwargs={
+            "run_id":               request.run_id,
+            "finetune_from_job_id": request.base_job_id,
+            "augmentation_config":  request.augmentation_config,
+        },
+        daemon=True,
+        name=f"finetune-{job_id[:8]}",
+    )
+    thread.start()
+
+    logger.info("Fine-tune job %s started from base %s", job_id, request.base_job_id)
+
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={
+            "job_id":       job_id,
+            "status":       "running",
+            "model_config": model_config,
+            "base_job_id":  request.base_job_id,
+        }),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/train/history/{model_name} — all runs for a model name
+# ---------------------------------------------------------------------------
+
+@router.get("/history/{model_name}")
+async def get_model_history(model_name: str) -> JSONResponse:
+    """
+    Return all training runs that share the given model_name, sorted by date.
+
+    Scans store.training_jobs (in-memory) for matching entries.
+    Each entry returns enough metadata to populate the history table:
+    job_id, date, session_id, epochs, final val accuracy, finetuned_from.
+    """
+    runs = []
+    for job_id, job in store.training_jobs.items():
+        # Match on model_name — case-insensitive strip for robustness
+        if job.get("model_name", "").strip().lower() != model_name.strip().lower():
+            continue
+        if job.get("status") != "done":
+            continue
+
+        history = job.get("history", [])
+        final   = history[-1] if history else {}
+
+        runs.append({
+            "job_id":         job_id,
+            "session_id":     job.get("session_id"),
+            "started_at":     job.get("started_at"),
+            "epochs_run":     len(history),
+            "final_val_acc":  final.get("val_acc"),
+            "final_train_acc": final.get("train_acc"),
+            "finetuned_from": job.get("finetuned_from"),
+            "model_path":     job.get("model_path"),
+        })
+
+    # Sort oldest → newest so a chart shows progression forward in time
+    runs.sort(key=lambda r: r["started_at"] or "")
+
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={"model_name": model_name, "runs": runs}),
     )
 
 

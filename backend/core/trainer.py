@@ -11,6 +11,12 @@ Why a thread instead of async?
   block the entire FastAPI event loop, making the server unresponsive.
   A daemon thread runs independently and only communicates via the shared
   store dict — no locks needed because Python's GIL protects simple list.append().
+
+New in P2-S3:
+  - augment_windows(): optional data augmentation (gaussian noise, time shift,
+    channel dropout) expands the training set to improve robustness.
+  - run_training() accepts finetune_from_job_id: loads weights from an existing
+    checkpoint before the training loop begins instead of random initialisation.
 """
 
 from __future__ import annotations
@@ -87,10 +93,103 @@ def compute_confusion_matrix(y_true: list[int], y_pred: list[int], n_classes: in
 
 
 # ---------------------------------------------------------------------------
+# augment_windows — expand training data with synthetic perturbations
+# ---------------------------------------------------------------------------
+
+def augment_windows(
+    X: np.ndarray,
+    y: np.ndarray,
+    config: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Expand the training set by applying augmentations to each window.
+
+    Each original window produces (multiplier - 1) augmented copies, so the
+    total set size becomes multiplier × original size. Augmentations are only
+    applied to copies — the original window is always preserved unchanged.
+
+    Args:
+        X:      Shape (N, n_channels, n_samples) — original windows.
+        y:      Shape (N,) — class indices.
+        config: Augmentation config dict from the training request:
+                {
+                  "gaussian_noise":  {"enabled": bool, "strength": float},
+                  "time_shift":      {"enabled": bool, "max_shift_ratio": float},
+                  "channel_dropout": {"enabled": bool},
+                  "multiplier":      int  (how many total copies per window)
+                }
+
+    Returns:
+        Tuple (X_aug, y_aug) with shape (N * multiplier, n_channels, n_samples).
+    """
+    multiplier = int(config.get("multiplier", 3))
+    if multiplier <= 1:
+        # No expansion requested — return originals unchanged
+        return X, y
+
+    noise_cfg   = config.get("gaussian_noise",  {})
+    shift_cfg   = config.get("time_shift",       {})
+    dropout_cfg = config.get("channel_dropout",  {})
+
+    noise_enabled   = noise_cfg.get("enabled",   False)
+    shift_enabled   = shift_cfg.get("enabled",   False)
+    dropout_enabled = dropout_cfg.get("enabled", False)
+
+    n_samples_time = X.shape[2]
+    rng = np.random.default_rng(seed=None)  # unseeded so each training run is different
+
+    all_X = [X]   # start with the original windows
+    all_y = [y]
+
+    for _ in range(multiplier - 1):
+        # Work on a copy so augmentations don't stack across copies
+        aug = X.copy().astype(np.float32)
+
+        if noise_enabled:
+            # Add Gaussian noise proportional to each window's own std.
+            # strength=0.05 means noise amplitude = 5% of the signal std.
+            strength = float(noise_cfg.get("strength", 0.05))
+            for i in range(len(aug)):
+                std = aug[i].std()
+                aug[i] += rng.normal(0, std * strength, aug[i].shape).astype(np.float32)
+
+        if shift_enabled:
+            # Roll each window by a random amount along the time axis.
+            # roll() wraps samples from the end to the beginning, which is
+            # a reasonable approximation of a temporal shift for cyclic-ish signals.
+            max_ratio = float(shift_cfg.get("max_shift_ratio", 0.1))
+            max_shift = max(1, int(n_samples_time * max_ratio))
+            for i in range(len(aug)):
+                shift = int(rng.integers(-max_shift, max_shift + 1))
+                if shift != 0:
+                    aug[i] = np.roll(aug[i], shift, axis=1)
+
+        if dropout_enabled:
+            # Zero out one randomly chosen channel per window.
+            # This forces the model not to rely on any single electrode.
+            n_channels = aug.shape[1]
+            for i in range(len(aug)):
+                ch = int(rng.integers(0, n_channels))
+                aug[i, ch, :] = 0.0
+
+        all_X.append(aug)
+        all_y.append(y.copy())
+
+    return np.concatenate(all_X, axis=0), np.concatenate(all_y, axis=0)
+
+
+# ---------------------------------------------------------------------------
 # run_training — the main training function, designed for a background thread
 # ---------------------------------------------------------------------------
 
-def run_training(job_id: str, session_id: str, model_config: dict, run_id: str | None = None) -> None:
+def run_training(
+    job_id:                str,
+    session_id:            str,
+    model_config:          dict,
+    run_id:                str | None = None,
+    finetune_from_job_id:  str | None = None,
+    augmentation_config:   dict | None = None,
+) -> None:
     """
     Run the full training pipeline for one job.
 
@@ -105,12 +204,15 @@ def run_training(job_id: str, session_id: str, model_config: dict, run_id: str |
       {"type": "error", "message": str}
 
     Args:
-        job_id:       UUID identifying this training job.
-        session_id:   UUID of the session whose labeled_data to train on.
-        model_config: ModelConfig dict from CLAUDE.md.
-        run_id:       Optional pipeline run_id. labeled_data is keyed by run_id.
-                      If provided, look up directly. Otherwise aggregate all
-                      labeled windows for the session (fallback).
+        job_id:               UUID identifying this training job.
+        session_id:           UUID of the session whose labeled_data to train on.
+        model_config:         ModelConfig dict from CLAUDE.md.
+        run_id:               Optional pipeline run_id. labeled_data is keyed by run_id.
+                              If provided, look up directly. Otherwise aggregate all
+                              labeled windows for the session (fallback).
+        finetune_from_job_id: If set, load weights from this existing checkpoint.
+                              Classes must match exactly; raises if they don't.
+        augmentation_config:  Optional dict controlling data augmentation (see augment_windows).
     """
     store = SessionStore()
 
@@ -182,6 +284,25 @@ def run_training(job_id: str, session_id: str, model_config: dict, run_id: str |
         )
 
         # ------------------------------------------------------------------
+        # 2b. Data augmentation (optional)
+        # Apply before train/val split so augmented copies stay in the training
+        # set. The split is random, so a tiny fraction may end up in validation,
+        # but that is acceptable and common practice.
+        # ------------------------------------------------------------------
+        if augmentation_config:
+            any_enabled = any([
+                augmentation_config.get("gaussian_noise",  {}).get("enabled", False),
+                augmentation_config.get("time_shift",      {}).get("enabled", False),
+                augmentation_config.get("channel_dropout", {}).get("enabled", False),
+            ])
+            if any_enabled and augmentation_config.get("multiplier", 1) > 1:
+                X, y = augment_windows(X, y, augmentation_config)
+                logger.info(
+                    "Job %s: augmented to %d samples (multiplier=%d)",
+                    job_id, len(X), augmentation_config.get("multiplier", 3),
+                )
+
+        # ------------------------------------------------------------------
         # 3. Build Dataset and train/val split (80/20)
         # ------------------------------------------------------------------
         dataset = EEGDataset(X, y)
@@ -220,6 +341,38 @@ def run_training(job_id: str, session_id: str, model_config: dict, run_id: str |
         else:
             model = EEGNet(n_channels, n_samples, n_classes).to(device)
             logger.info("Job %s: using default EEGNet", job_id)
+
+        # ------------------------------------------------------------------
+        # 4b. Fine-tuning: load weights from an existing checkpoint.
+        # This overwrites the random initialisation with trained weights so
+        # the model starts from a better starting point.
+        # ------------------------------------------------------------------
+        if finetune_from_job_id:
+            base_path = os.path.join(EXPORTS_DIR, f"{finetune_from_job_id}.pt")
+            if not os.path.exists(base_path):
+                fail(f"Base model file not found: {base_path}")
+                return
+
+            base_ckpt = torch.load(base_path, map_location="cpu", weights_only=False)
+            base_classes = base_ckpt.get("class_names", [])
+
+            # Classes must match exactly — the final linear layer's output size
+            # is fixed to n_classes, so swapping or adding classes would break
+            # the weight shapes.
+            if sorted(base_classes) != sorted(classes):
+                fail(
+                    f"Class mismatch: base model has {base_classes} "
+                    f"but current training data has {classes}. "
+                    "Fine-tuning requires identical class lists."
+                )
+                return
+
+            model.load_state_dict(base_ckpt["model_state_dict"])
+            model.train()
+            logger.info(
+                "Job %s: fine-tuning from %s (classes: %s)",
+                job_id, finetune_from_job_id, classes,
+            )
 
         # Adam is the standard choice for EEG models — handles sparse gradients
         # and adapts learning rate per-parameter.
@@ -348,7 +501,8 @@ def run_training(job_id: str, session_id: str, model_config: dict, run_id: str |
             if isinstance(run_entry, dict):
                 pipeline_config = run_entry.get("pipeline_config")
 
-        # Save both weights and the config so we can reconstruct the model later
+        # Save both weights and the config so we can reconstruct the model later.
+        # finetuned_from is stored for history traceability — None means scratch.
         torch.save({
             "model_state_dict": model.state_dict(),
             "model_config":     model_config,
@@ -359,6 +513,7 @@ def run_training(job_id: str, session_id: str, model_config: dict, run_id: str |
             "trained_at":       datetime.now(timezone.utc).isoformat(),
             "sample_rate":      sample_rate,
             "pipeline_config":  pipeline_config,
+            "finetuned_from":   finetune_from_job_id,
         }, model_path)
 
         logger.info("Model saved to %s", model_path)
@@ -369,8 +524,9 @@ def run_training(job_id: str, session_id: str, model_config: dict, run_id: str |
         final_val_acc   = history[-1]["val_acc"]   if history else 0.0
         final_train_acc = history[-1]["train_acc"] if history else 0.0
 
-        store.training_jobs[job_id]["status"]     = "done"
-        store.training_jobs[job_id]["model_path"] = model_path
+        store.training_jobs[job_id]["status"]         = "done"
+        store.training_jobs[job_id]["model_path"]     = model_path
+        store.training_jobs[job_id]["finetuned_from"] = finetune_from_job_id
 
         push({
             "type":             "done",
@@ -379,6 +535,7 @@ def run_training(job_id: str, session_id: str, model_config: dict, run_id: str |
             "confusion_matrix": confusion,
             "class_names":      classes,
             "model_path":       model_path,
+            "finetuned_from":   finetune_from_job_id,
         })
 
     except Exception as exc:

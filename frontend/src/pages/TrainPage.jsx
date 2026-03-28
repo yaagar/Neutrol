@@ -1,16 +1,15 @@
-// TrainPage.jsx — model configuration, training trigger, live progress, and results
+// TrainPage.jsx — model configuration, training trigger, live progress, results, and history
 //
 // Page flow:
 //   1. Load label summary from the backend → show class distribution
 //   2. User selects a pipeline run to train on
-//   3. User configures the model (learning rate, epochs, batch size, layers)
-//   4. User clicks "Start Training" → POST /api/train/start → get job_id
-//   5. Connect WebSocket to /api/train/ws/{job_id}/progress
-//   6. Receive progress messages → update loss/accuracy charts in real time
-//   7. When training finishes → show final accuracy + confusion matrix
-//
-// State is persisted in Zustand (trainPageState) so navigating away and back
-// does not reset the form or wipe the in-progress training results.
+//   3. Choose training mode: from scratch OR fine-tune an existing model
+//   4. Optionally enable data augmentation (gaussian noise, time shift, channel dropout)
+//   5. User clicks "Start Training" → POST /api/train/start or /api/train/finetune
+//   6. WebSocket /api/train/ws/{job_id}/progress → live loss/accuracy charts
+//   7. When done → final accuracy + confusion matrix
+//   8. Model History section shows all runs for a model name with accuracy chart
+//   9. Model Comparison section shows side-by-side metrics for selected models
 import { useState, useEffect, useRef } from 'react'
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid,
@@ -24,17 +23,31 @@ import { API_BASE_URL, WS_BASE_URL } from '../config'
 const API    = API_BASE_URL
 const WS_API = WS_BASE_URL
 
+// ---------------------------------------------------------------------------
+// Compute per-class precision/recall/F1 from a confusion matrix
+// ---------------------------------------------------------------------------
+function computeMetrics(matrix, classNames) {
+  return classNames.map((name, i) => {
+    const tp  = matrix[i][i]
+    const fp  = matrix.reduce((s, row, r) => r !== i ? s + row[i] : s, 0)
+    const fn  = matrix[i].reduce((s, v, c) => c !== i ? s + v : s, 0)
+    const prec   = tp + fp > 0 ? tp / (tp + fp) : 0
+    const recall = tp + fn > 0 ? tp / (tp + fn) : 0
+    const f1     = prec + recall > 0 ? 2 * prec * recall / (prec + recall) : 0
+    return { name, precision: prec, recall, f1 }
+  })
+}
+
 export default function TrainPage() {
   const { currentSession } = useSession()
 
   // --- Zustand persistent state ---
-  const trainPageState     = useAppStore(s => s.trainPageState)
-  const setTrainPageState  = useAppStore(s => s.setTrainPageState)
+  const trainPageState    = useAppStore(s => s.trainPageState)
+  const setTrainPageState = useAppStore(s => s.setTrainPageState)
 
-  // Destructure for local convenience — writes go back through setTrainPageState
   const { config, layers, jobId, status, history, finalResult, selectedRunId, modelName } = trainPageState
 
-  // --- Non-persisted UI state (reset on mount is fine) ---
+  // --- Non-persisted UI state ---
   const [labelSummary, setLabelSummary]     = useState(null)
   const [labelsLoading, setLabelsLoading]   = useState(false)
   const [trainingError, setTrainingError]   = useState(null)
@@ -44,27 +57,55 @@ export default function TrainPage() {
   const [renaming, setRenaming]             = useState(false)
   const [renameInput, setRenameInput]       = useState('')
 
-  // WebSocket ref — managed manually for fine-grained connect/disconnect control
+  // Training mode: 'scratch' or 'finetune'
+  const [trainingMode, setTrainingMode]     = useState('scratch')
+  // All done jobs for base-model dropdown and comparison
+  const [allJobs, setAllJobs]               = useState([])
+  // Selected base job for fine-tuning
+  const [baseJobId, setBaseJobId]           = useState('')
+  // Compatibility message for fine-tune mode
+  const [compatMsg, setCompatMsg]           = useState(null)  // {ok: bool, msg: str} | null
+
+  // Augmentation config
+  const [augOpen, setAugOpen]               = useState(false)
+  const [augConfig, setAugConfig]           = useState({
+    gaussian_noise:  { enabled: false, strength: 0.05 },
+    time_shift:      { enabled: false, max_shift_ratio: 0.1 },
+    channel_dropout: { enabled: false },
+    multiplier: 3,
+  })
+
+  // Model history panel
+  const [showHistory, setShowHistory]       = useState(false)
+  const [historyName, setHistoryName]       = useState('')
+  const [historyData, setHistoryData]       = useState(null)  // {runs: [...]}
+  const [historyLoading, setHistoryLoading] = useState(false)
+
+  // Model comparison panel
+  const [showCompare, setShowCompare]       = useState(false)
+  const [compareSelected, setCompareSelected] = useState(new Set())
+  const [compareData, setCompareData]       = useState({})  // job_id → results
+
   const wsRef = useRef(null)
 
-  // --- On session change: reset run selection and reload runs ---
-  // We do NOT call fetchLabelSummary() here — it fires automatically via the
-  // useEffect([selectedRunId]) below once fetchRuns() sets the new run_id.
-  // Calling it here would race against the run selection update.
+  // -------------------------------------------------------------------------
+  // On session change: reset run selection and reload data
+  // -------------------------------------------------------------------------
   useEffect(() => {
     if (!currentSession) return
     setTrainPageState({ selectedRunId: null })
     fetchRuns()
+    fetchAllJobs()
   }, [currentSession?.session_id])
 
-  // --- Reconnect WebSocket when jobId is set (e.g. after page refresh restores state) ---
+  // -------------------------------------------------------------------------
+  // Reconnect WebSocket when jobId is set (e.g. after page refresh)
+  // -------------------------------------------------------------------------
   useEffect(() => {
     if (!jobId || status !== 'running') return
-
     if (wsRef.current) wsRef.current.close()
     const ws = new WebSocket(`${WS_API}/api/train/ws/${jobId}/progress`)
     wsRef.current = ws
-
     ws.onmessage = (event) => {
       try { handleTrainingMessage(JSON.parse(event.data)) }
       catch { /* ignore non-JSON */ }
@@ -75,6 +116,30 @@ export default function TrainPage() {
     }
     return () => ws.close()
   }, [jobId])
+
+  // -------------------------------------------------------------------------
+  // Validate fine-tune compatibility when base job or label summary changes
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (trainingMode !== 'finetune' || !baseJobId || !labelSummary) {
+      setCompatMsg(null)
+      return
+    }
+    const baseJob = allJobs.find(j => j.job_id === baseJobId)
+    if (!baseJob) { setCompatMsg(null); return }
+
+    const baseClasses    = [...(baseJob.classes || [])].sort()
+    const currentClasses = Object.keys(labelSummary.counts).filter(l => l !== 'unknown').sort()
+
+    if (JSON.stringify(baseClasses) === JSON.stringify(currentClasses)) {
+      setCompatMsg({ ok: true, msg: `Compatible — classes match: ${baseClasses.join(', ')}` })
+    } else {
+      setCompatMsg({
+        ok: false,
+        msg: `Class mismatch: base has [${baseClasses.join(', ')}] but labels have [${currentClasses.join(', ')}]`
+      })
+    }
+  }, [trainingMode, baseJobId, labelSummary, allJobs])
 
   // -------------------------------------------------------------------------
   // Message handler — processes each WebSocket message by type
@@ -92,6 +157,7 @@ export default function TrainPage() {
       }))
     } else if (msg.type === 'done') {
       setTrainPageState({ finalResult: msg, status: 'done' })
+      fetchAllJobs()  // refresh so new model appears in dropdown/history/compare
     } else if (msg.type === 'error') {
       setTrainingError(msg.message)
       setTrainPageState({ status: 'failed' })
@@ -110,9 +176,6 @@ export default function TrainPage() {
       if (json.success) {
         const sessionRuns = json.data.filter(r => r.session_id === currentSession.session_id)
         setRuns(sessionRuns)
-        // Always select the most recent run for this session.
-        // Not using !selectedRunId check because the previous session's run_id
-        // could still be in Zustand state after a session switch.
         if (sessionRuns.length > 0) {
           setTrainPageState({ selectedRunId: sessionRuns[sessionRuns.length - 1].run_id })
         }
@@ -121,15 +184,21 @@ export default function TrainPage() {
     finally { setRunsLoading(false) }
   }
 
-  // runId is passed explicitly to avoid stale-closure issues.
-  // When a run is selected, we call GET /api/labels/by-run/{runId} directly —
-  // no client-side filtering needed, and no risk of a concurrent call with the
-  // wrong closed-over selectedRunId overwriting the result.
+  async function fetchAllJobs() {
+    try {
+      const res  = await fetch(`${API}/api/train/jobs`)
+      const json = await res.json()
+      if (json.success) {
+        setAllJobs(json.data.jobs.filter(j => j.status === 'done'))
+      }
+    } catch { /* ignore */ }
+  }
+
   async function fetchLabelSummary(runId) {
     if (!currentSession) return
     setLabelsLoading(true)
     try {
-      const url = runId
+      const url  = runId
         ? `${API}/api/labels/by-run/${runId}`
         : `${API}/api/labels/${currentSession.session_id}`
       const res  = await fetch(url)
@@ -148,32 +217,57 @@ export default function TrainPage() {
 
   async function startTraining() {
     if (!currentSession || !labelSummary || labelSummary.total === 0) return
+    if (trainingMode === 'finetune' && (!baseJobId || !compatMsg?.ok)) return
 
     setStarting(true)
     setTrainingError(null)
     setTrainPageState({ history: [], finalResult: null, status: 'idle' })
 
-    const detectedClasses = Object.keys(labelSummary.counts).sort()
+    const detectedClasses = Object.keys(labelSummary.counts).filter(l => l !== 'unknown').sort()
     const inputSamples    = currentSession.sample_rate * 1
 
-    const modelConfig = {
-      ...config,
-      classes:        detectedClasses,
-      input_channels: currentSession.n_channels,
-      input_samples:  inputSamples,
-      layers,
-    }
+    // Build augmentation payload — only include if at least one option is enabled
+    const anyAugEnabled = augConfig.gaussian_noise.enabled ||
+                          augConfig.time_shift.enabled ||
+                          augConfig.channel_dropout.enabled
+    const augPayload = anyAugEnabled ? augConfig : null
 
     try {
-      const res  = await fetch(`${API}/api/train/start`, {
+      let url, body
+
+      if (trainingMode === 'finetune') {
+        // Fine-tune: backend uses base model's architecture — we don't send layers
+        url  = `${API}/api/train/finetune`
+        body = {
+          base_job_id:         baseJobId,
+          session_id:          currentSession.session_id,
+          run_id:              selectedRunId || null,
+          model_name:          modelName,
+          augmentation_config: augPayload,
+        }
+      } else {
+        // Train from scratch: send full model config
+        const modelConfig = {
+          ...config,
+          classes:        detectedClasses,
+          input_channels: currentSession.n_channels,
+          input_samples:  inputSamples,
+          layers,
+        }
+        url  = `${API}/api/train/start`
+        body = {
+          session_id:          currentSession.session_id,
+          run_id:              selectedRunId || null,
+          model_name:          modelName,
+          training_config:     modelConfig,
+          augmentation_config: augPayload,
+        }
+      }
+
+      const res  = await fetch(url, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id:      currentSession.session_id,
-          run_id:          selectedRunId || null,
-          model_name:      modelName,
-          training_config: modelConfig,
-        }),
+        body:    JSON.stringify(body),
       })
       const json = await res.json()
       if (json.success) {
@@ -194,22 +288,65 @@ export default function TrainPage() {
     if (!jobId) return
     setRenaming(true)
     try {
-      const res = await fetch(`${API}/api/train/${jobId}/name`, {
+      const res  = await fetch(`${API}/api/train/${jobId}/name`, {
         method:  'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model_name: renameInput }),
+        body:    JSON.stringify({ model_name: renameInput }),
       })
       const json = await res.json()
       if (json.success) {
         setTrainPageState({ modelName: json.data.model_name })
         setRenameInput('')
+        fetchAllJobs()
       }
     } catch { /* ignore */ }
     finally { setRenaming(false) }
   }
 
-  // Refresh label summary whenever the selected run changes.
-  // Pass selectedRunId explicitly so fetchLabelSummary always uses the current value.
+  async function fetchHistory() {
+    if (!historyName.trim()) return
+    setHistoryLoading(true)
+    try {
+      const res  = await fetch(`${API}/api/train/history/${encodeURIComponent(historyName.trim())}`)
+      const json = await res.json()
+      if (json.success) setHistoryData(json.data)
+    } catch { /* ignore */ }
+    finally { setHistoryLoading(false) }
+  }
+
+  async function fetchCompareResults(jobId) {
+    if (compareData[jobId]) return   // already loaded
+    try {
+      const res  = await fetch(`${API}/api/train/${jobId}/results`)
+      const json = await res.json()
+      if (json.success) {
+        setCompareData(prev => ({ ...prev, [jobId]: json.data }))
+      }
+    } catch { /* ignore */ }
+  }
+
+  function toggleCompareJob(jId) {
+    setCompareSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(jId)) {
+        next.delete(jId)
+      } else {
+        next.add(jId)
+        fetchCompareResults(jId)
+      }
+      return next
+    })
+  }
+
+  // Update augmentation config helper — patch a nested key
+  function setAugField(section, key, value) {
+    setAugConfig(prev => ({
+      ...prev,
+      [section]: { ...prev[section], [key]: value },
+    }))
+  }
+
+  // Refresh label summary whenever selected run changes
   useEffect(() => {
     if (currentSession) fetchLabelSummary(selectedRunId)
   }, [selectedRunId])
@@ -229,9 +366,17 @@ export default function TrainPage() {
     )
   }
 
-  const detectedClasses = labelSummary ? Object.keys(labelSummary.counts).filter(l => l !== 'unknown').sort() : []
-  const totalEpochs     = config.epochs
-  const currentEpoch    = history.length
+  const detectedClasses = labelSummary
+    ? Object.keys(labelSummary.counts).filter(l => l !== 'unknown').sort()
+    : []
+  const totalEpochs  = config.epochs
+  const currentEpoch = history.length
+
+  const startDisabled = starting
+    || !labelSummary
+    || labelSummary.total === 0
+    || (trainingMode === 'scratch' && detectedClasses.length < 2)
+    || (trainingMode === 'finetune' && (!baseJobId || !compatMsg?.ok))
 
   // -------------------------------------------------------------------------
   // Render
@@ -245,7 +390,7 @@ export default function TrainPage() {
       </p>
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 1: Run selector                                              */}
+      {/* Section 1: Pipeline Run selector                                    */}
       {/* ------------------------------------------------------------------ */}
       <section className="mb-8">
         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
@@ -305,13 +450,12 @@ export default function TrainPage() {
       </section>
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 2: Label summary                                             */}
+      {/* Section 2: Labeled data summary                                     */}
       {/* ------------------------------------------------------------------ */}
       <section className="mb-8">
         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
           Labeled Data
         </h2>
-
         {labelsLoading ? (
           <p className="text-gray-500 text-sm">Loading labels…</p>
         ) : !labelSummary || labelSummary.total === 0 ? (
@@ -343,93 +487,318 @@ export default function TrainPage() {
       </section>
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 3: Model configuration                                       */}
+      {/* Section 3: Training Mode toggle                                     */}
       {/* ------------------------------------------------------------------ */}
       <section className="mb-8">
         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
-          Model Configuration
+          Training Mode
         </h2>
-
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          {/* Model name */}
-          <div className="mb-4">
-            <p className="text-xs text-gray-500 mb-1">Model Name (optional)</p>
-            <input
-              type="text"
-              placeholder="e.g. Motor Imagery v1"
-              value={modelName}
-              onChange={e => setTrainPageState({ modelName: e.target.value })}
-              disabled={status === 'running'}
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-purple-500 disabled:opacity-50"
-            />
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          {/* Mode toggle buttons */}
+          <div className="flex gap-2 mb-4">
+            {[
+              { value: 'scratch',  label: 'Train from scratch' },
+              { value: 'finetune', label: 'Fine-tune existing model' },
+            ].map(opt => (
+              <button
+                key={opt.value}
+                onClick={() => setTrainingMode(opt.value)}
+                disabled={status === 'running'}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  trainingMode === opt.value
+                    ? 'bg-purple-600 text-white'
+                    : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                } disabled:opacity-50`}
+              >
+                {opt.label}
+              </button>
+            ))}
           </div>
 
-          {/* Auto-detected classes */}
-          <div className="mb-4">
-            <p className="text-xs text-gray-500 mb-1">Classes (auto-detected from labels — excludes 'unknown')</p>
-            {detectedClasses.length > 0 ? (
-              <div className="flex gap-2 flex-wrap">
-                {detectedClasses.map(c => (
-                  <span key={c} className="bg-purple-900/40 border border-purple-700 text-purple-300 text-xs px-2 py-0.5 rounded">
-                    {c}
-                  </span>
-                ))}
+          {/* Fine-tune: base model selector */}
+          {trainingMode === 'finetune' && (
+            <div className="flex flex-col gap-3">
+              <div>
+                <p className="text-xs text-gray-500 mb-1">Base model to fine-tune from:</p>
+                {allJobs.length === 0 ? (
+                  <p className="text-yellow-400 text-sm">No trained models found. Train a model first.</p>
+                ) : (
+                  <select
+                    value={baseJobId}
+                    onChange={e => setBaseJobId(e.target.value)}
+                    disabled={status === 'running'}
+                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  >
+                    <option value="">— select a model —</option>
+                    {allJobs.map(j => (
+                      <option key={j.job_id} value={j.job_id}>
+                        {j.model_name || `Model ${j.job_id.slice(0, 8)}`}
+                        {j.final_val_acc != null ? ` — ${(j.final_val_acc * 100).toFixed(1)}% val acc` : ''}
+                        {' '}[{(j.classes || []).join(', ')}]
+                      </option>
+                    ))}
+                  </select>
+                )}
               </div>
-            ) : (
-              <span className="text-gray-600 text-xs">No labels detected</span>
-            )}
-          </div>
 
-          {/* Layer architecture editor */}
-          <div className="mb-5">
-            <p className="text-xs text-gray-500 mb-3">
-              Layer Architecture
-              <span className="ml-2 text-gray-600">
-                — click × to delete, use ▲▼ to reorder
-              </span>
-            </p>
-            <ModelLayerEditor
-              layers={layers}
-              onChange={(newLayers) => setTrainPageState({ layers: newLayers })}
-              inputChannels={currentSession.n_channels}
-              inputSamples={currentSession.sample_rate * 1}
-              classes={detectedClasses}
-            />
-          </div>
+              {/* Compatibility validation message */}
+              {compatMsg && (
+                <div className={`rounded-lg px-3 py-2 text-sm ${
+                  compatMsg.ok
+                    ? 'bg-green-900/20 border border-green-700 text-green-300'
+                    : 'bg-red-900/20 border border-red-700 text-red-300'
+                }`}>
+                  {compatMsg.ok ? '✓ ' : '✗ '}{compatMsg.msg}
+                </div>
+              )}
 
-          <div className="grid grid-cols-3 gap-4">
-            <label className="flex flex-col gap-1">
-              <span className="text-xs text-gray-400">Learning rate</span>
-              <input
-                type="number" step="0.0001" min="0.00001" max="0.1"
-                value={config.learning_rate}
-                onChange={e => setTrainPageState({ config: { ...config, learning_rate: parseFloat(e.target.value) } })}
-                disabled={status === 'running'}
-                className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
-              />
-            </label>
-            <label className="flex flex-col gap-1">
-              <span className="text-xs text-gray-400">Epochs</span>
-              <input
-                type="number" step="1" min="1" max="500"
-                value={config.epochs}
-                onChange={e => setTrainPageState({ config: { ...config, epochs: parseInt(e.target.value) } })}
-                disabled={status === 'running'}
-                className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
-              />
-            </label>
-            <label className="flex flex-col gap-1">
-              <span className="text-xs text-gray-400">Batch size</span>
-              <input
-                type="number" step="1" min="1" max="256"
-                value={config.batch_size}
-                onChange={e => setTrainPageState({ config: { ...config, batch_size: parseInt(e.target.value) } })}
-                disabled={status === 'running'}
-                className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
-              />
-            </label>
-          </div>
+              <p className="text-xs text-gray-600">
+                Fine-tuning loads the base model's weights as a starting point. Classes must match exactly.
+                The new model is saved separately — the base model is not overwritten.
+              </p>
+            </div>
+          )}
+
+          {/* Scratch mode: show layer editor and hyperparameters */}
+          {trainingMode === 'scratch' && (
+            <>
+              {/* Model name */}
+              <div className="mb-4">
+                <p className="text-xs text-gray-500 mb-1">Model Name (optional)</p>
+                <input
+                  type="text"
+                  placeholder="e.g. Motor Imagery v1"
+                  value={modelName}
+                  onChange={e => setTrainPageState({ modelName: e.target.value })}
+                  disabled={status === 'running'}
+                  className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                />
+              </div>
+
+              {/* Auto-detected classes */}
+              <div className="mb-4">
+                <p className="text-xs text-gray-500 mb-1">Classes (auto-detected from labels — excludes 'unknown')</p>
+                {detectedClasses.length > 0 ? (
+                  <div className="flex gap-2 flex-wrap">
+                    {detectedClasses.map(c => (
+                      <span key={c} className="bg-purple-900/40 border border-purple-700 text-purple-300 text-xs px-2 py-0.5 rounded">
+                        {c}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="text-gray-600 text-xs">No labels detected</span>
+                )}
+              </div>
+
+              {/* Layer architecture editor */}
+              <div className="mb-5">
+                <p className="text-xs text-gray-500 mb-3">
+                  Layer Architecture
+                  <span className="ml-2 text-gray-600">— click × to delete, use ▲▼ to reorder</span>
+                </p>
+                <ModelLayerEditor
+                  layers={layers}
+                  onChange={(newLayers) => setTrainPageState({ layers: newLayers })}
+                  inputChannels={currentSession.n_channels}
+                  inputSamples={currentSession.sample_rate * 1}
+                  classes={detectedClasses}
+                />
+              </div>
+
+              <div className="grid grid-cols-3 gap-4">
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-400">Learning rate</span>
+                  <input
+                    type="number" step="0.0001" min="0.00001" max="0.1"
+                    value={config.learning_rate}
+                    onChange={e => setTrainPageState({ config: { ...config, learning_rate: parseFloat(e.target.value) } })}
+                    disabled={status === 'running'}
+                    className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-400">Epochs</span>
+                  <input
+                    type="number" step="1" min="1" max="500"
+                    value={config.epochs}
+                    onChange={e => setTrainPageState({ config: { ...config, epochs: parseInt(e.target.value) } })}
+                    disabled={status === 'running'}
+                    className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-400">Batch size</span>
+                  <input
+                    type="number" step="1" min="1" max="256"
+                    value={config.batch_size}
+                    onChange={e => setTrainPageState({ config: { ...config, batch_size: parseInt(e.target.value) } })}
+                    disabled={status === 'running'}
+                    className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  />
+                </label>
+              </div>
+            </>
+          )}
+
+          {/* Fine-tune mode: also show model name + hyperparameters */}
+          {trainingMode === 'finetune' && baseJobId && (
+            <div className="mt-4 pt-4 border-t border-gray-800">
+              <p className="text-xs text-gray-500 mb-3">Fine-tune settings:</p>
+              <div className="mb-3">
+                <p className="text-xs text-gray-500 mb-1">Model Name (optional)</p>
+                <input
+                  type="text"
+                  placeholder="e.g. Motor Imagery v2 (fine-tuned)"
+                  value={modelName}
+                  onChange={e => setTrainPageState({ modelName: e.target.value })}
+                  disabled={status === 'running'}
+                  className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-400">Epochs</span>
+                  <input
+                    type="number" step="1" min="1" max="200"
+                    value={config.epochs}
+                    onChange={e => setTrainPageState({ config: { ...config, epochs: parseInt(e.target.value) } })}
+                    disabled={status === 'running'}
+                    className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-400">Learning rate</span>
+                  <input
+                    type="number" step="0.0001" min="0.00001" max="0.1"
+                    value={config.learning_rate}
+                    onChange={e => setTrainPageState({ config: { ...config, learning_rate: parseFloat(e.target.value) } })}
+                    disabled={status === 'running'}
+                    className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  />
+                </label>
+              </div>
+            </div>
+          )}
         </div>
+      </section>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Section 4: Data Augmentation (collapsible)                          */}
+      {/* ------------------------------------------------------------------ */}
+      <section className="mb-8">
+        <button
+          onClick={() => setAugOpen(o => !o)}
+          className="flex items-center gap-2 text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3 hover:text-gray-200 transition-colors"
+        >
+          <span>{augOpen ? '▾' : '▸'}</span>
+          Data Augmentation
+          {(augConfig.gaussian_noise.enabled || augConfig.time_shift.enabled || augConfig.channel_dropout.enabled) && (
+            <span className="text-xs font-normal normal-case tracking-normal bg-purple-900/40 border border-purple-700 text-purple-300 px-2 py-0.5 rounded-full ml-1">
+              active
+            </span>
+          )}
+        </button>
+
+        {augOpen && (
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <p className="text-xs text-gray-500 mb-4">
+              Augmentation creates extra copies of each window with synthetic variations.
+              Helps the model generalize when you have limited data. Off by default.
+            </p>
+
+            <div className="flex flex-col gap-4">
+              {/* Gaussian Noise */}
+              <div className="flex items-start gap-3">
+                <input
+                  type="checkbox"
+                  id="aug-noise"
+                  checked={augConfig.gaussian_noise.enabled}
+                  onChange={e => setAugField('gaussian_noise', 'enabled', e.target.checked)}
+                  className="mt-1 accent-purple-500"
+                />
+                <div className="flex-1">
+                  <label htmlFor="aug-noise" className="text-sm text-gray-200 font-medium cursor-pointer">
+                    Gaussian Noise
+                  </label>
+                  <p className="text-xs text-gray-500">Adds small random noise — makes model robust to signal variation</p>
+                  {augConfig.gaussian_noise.enabled && (
+                    <label className="flex items-center gap-2 mt-2">
+                      <span className="text-xs text-gray-400">Strength (% of signal std):</span>
+                      <input
+                        type="number" step="0.01" min="0.001" max="0.5"
+                        value={augConfig.gaussian_noise.strength}
+                        onChange={e => setAugField('gaussian_noise', 'strength', parseFloat(e.target.value))}
+                        className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-purple-500"
+                      />
+                    </label>
+                  )}
+                </div>
+              </div>
+
+              {/* Time Shift */}
+              <div className="flex items-start gap-3">
+                <input
+                  type="checkbox"
+                  id="aug-shift"
+                  checked={augConfig.time_shift.enabled}
+                  onChange={e => setAugField('time_shift', 'enabled', e.target.checked)}
+                  className="mt-1 accent-purple-500"
+                />
+                <div className="flex-1">
+                  <label htmlFor="aug-shift" className="text-sm text-gray-200 font-medium cursor-pointer">
+                    Time Shift
+                  </label>
+                  <p className="text-xs text-gray-500">Shifts each window ±shift% in time — robust to temporal misalignment</p>
+                  {augConfig.time_shift.enabled && (
+                    <label className="flex items-center gap-2 mt-2">
+                      <span className="text-xs text-gray-400">Max shift (% of window):</span>
+                      <input
+                        type="number" step="0.01" min="0.01" max="0.3"
+                        value={augConfig.time_shift.max_shift_ratio}
+                        onChange={e => setAugField('time_shift', 'max_shift_ratio', parseFloat(e.target.value))}
+                        className="w-20 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-purple-500"
+                      />
+                    </label>
+                  )}
+                </div>
+              </div>
+
+              {/* Channel Dropout */}
+              <div className="flex items-start gap-3">
+                <input
+                  type="checkbox"
+                  id="aug-dropout"
+                  checked={augConfig.channel_dropout.enabled}
+                  onChange={e => setAugField('channel_dropout', 'enabled', e.target.checked)}
+                  className="mt-1 accent-purple-500"
+                />
+                <div className="flex-1">
+                  <label htmlFor="aug-dropout" className="text-sm text-gray-200 font-medium cursor-pointer">
+                    Channel Dropout
+                  </label>
+                  <p className="text-xs text-gray-500">Randomly zeros one channel per copy — robust to electrode artifacts</p>
+                </div>
+              </div>
+
+              {/* Multiplier */}
+              {(augConfig.gaussian_noise.enabled || augConfig.time_shift.enabled || augConfig.channel_dropout.enabled) && (
+                <div className="flex items-center gap-3 pt-2 border-t border-gray-800">
+                  <span className="text-xs text-gray-400">Copies per original window:</span>
+                  <input
+                    type="number" step="1" min="2" max="10"
+                    value={augConfig.multiplier}
+                    onChange={e => setAugConfig(prev => ({ ...prev, multiplier: parseInt(e.target.value) }))}
+                    className="w-16 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-purple-500"
+                  />
+                  <span className="text-xs text-gray-500">
+                    (dataset size × {augConfig.multiplier})
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </section>
 
       {/* ------------------------------------------------------------------ */}
@@ -439,12 +808,17 @@ export default function TrainPage() {
         <div className="mb-8">
           <button
             onClick={startTraining}
-            disabled={starting || !labelSummary || labelSummary.total === 0 || detectedClasses.length < 2}
+            disabled={startDisabled}
             className="bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white font-medium px-6 py-2.5 rounded-lg transition-colors text-sm"
           >
-            {starting ? 'Starting…' : status === 'done' ? 'Train Again' : 'Start Training'}
+            {starting
+              ? 'Starting…'
+              : status === 'done'
+                ? (trainingMode === 'finetune' ? 'Fine-tune Again' : 'Train Again')
+                : (trainingMode === 'finetune' ? 'Fine-tune' : 'Start Training')
+            }
           </button>
-          {detectedClasses.length < 2 && labelSummary?.total > 0 && (
+          {trainingMode === 'scratch' && detectedClasses.length < 2 && labelSummary?.total > 0 && (
             <p className="text-yellow-400 text-xs mt-2">
               Need at least 2 different classes to train. Currently: {detectedClasses.join(', ') || 'none'}.
             </p>
@@ -456,7 +830,7 @@ export default function TrainPage() {
       )}
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 4: Live training progress                                    */}
+      {/* Section 5: Live training progress                                   */}
       {/* ------------------------------------------------------------------ */}
       {(status === 'running' || history.length > 0) && (
         <section className="mb-8">
@@ -476,12 +850,8 @@ export default function TrainPage() {
                   </span>
                 </>
               )}
-              {status === 'done' && (
-                <span className="text-xs text-green-400 font-medium">Complete</span>
-              )}
-              {status === 'failed' && (
-                <span className="text-xs text-red-400 font-medium">Failed</span>
-              )}
+              {status === 'done'   && <span className="text-xs text-green-400 font-medium">Complete</span>}
+              {status === 'failed' && <span className="text-xs text-red-400 font-medium">Failed</span>}
             </div>
           </div>
 
@@ -533,10 +903,10 @@ export default function TrainPage() {
       )}
 
       {/* ------------------------------------------------------------------ */}
-      {/* Section 5: Final results + confusion matrix                          */}
+      {/* Section 6: Final results + confusion matrix                         */}
       {/* ------------------------------------------------------------------ */}
       {status === 'done' && finalResult && (
-        <section>
+        <section className="mb-8">
           <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">
             Results
           </h2>
@@ -579,6 +949,12 @@ export default function TrainPage() {
             </div>
           </div>
 
+          {finalResult.finetuned_from && (
+            <div className="bg-blue-900/20 border border-blue-800 rounded-lg px-3 py-2 text-xs text-blue-300 mb-4">
+              Fine-tuned from model {finalResult.finetuned_from.slice(0, 8)}…
+            </div>
+          )}
+
           {finalResult.confusion_matrix && finalResult.class_names && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
               <p className="text-xs text-gray-500 mb-1">Confusion Matrix</p>
@@ -597,6 +973,171 @@ export default function TrainPage() {
           )}
         </section>
       )}
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Section 7: Model History                                            */}
+      {/* ------------------------------------------------------------------ */}
+      <section className="mb-8">
+        <button
+          onClick={() => setShowHistory(h => !h)}
+          className="flex items-center gap-2 text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3 hover:text-gray-200 transition-colors"
+        >
+          <span>{showHistory ? '▾' : '▸'}</span>
+          Model History
+        </button>
+
+        {showHistory && (
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <p className="text-xs text-gray-500 mb-3">
+              View all training runs for a model name to track improvement over time.
+            </p>
+            <div className="flex gap-2 mb-4">
+              <input
+                type="text"
+                placeholder="Enter model name…"
+                value={historyName}
+                onChange={e => setHistoryName(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && fetchHistory()}
+                className="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-purple-500"
+              />
+              <button
+                onClick={fetchHistory}
+                disabled={historyLoading || !historyName.trim()}
+                className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-gray-200 text-sm px-4 py-1.5 rounded transition"
+              >
+                {historyLoading ? 'Loading…' : 'Load'}
+              </button>
+            </div>
+
+            {historyData && (
+              historyData.runs.length === 0 ? (
+                <p className="text-gray-500 text-sm">No completed runs found for "{historyData.model_name}".</p>
+              ) : (
+                <>
+                  {/* Accuracy chart across runs */}
+                  <div className="mb-4">
+                    <p className="text-xs text-gray-500 mb-2">Val Accuracy over training runs</p>
+                    <ResponsiveContainer width="100%" height={160}>
+                      <LineChart data={historyData.runs.map((r, i) => ({
+                        run: `Run ${i + 1}`,
+                        val_acc: r.final_val_acc != null ? parseFloat((r.final_val_acc * 100).toFixed(1)) : null,
+                      }))}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                        <XAxis dataKey="run" stroke="#6b7280" tick={{ fontSize: 11 }} />
+                        <YAxis stroke="#6b7280" tick={{ fontSize: 11 }} domain={[0, 100]} />
+                        <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 12 }} formatter={v => `${v}%`} />
+                        <Line type="monotone" dataKey="val_acc" name="Val Acc" stroke="#60a5fa" strokeWidth={2} dot={{ r: 4 }} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* History table */}
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs border-collapse">
+                      <thead>
+                        <tr className="text-gray-500 border-b border-gray-800">
+                          <th className="text-left py-2 pr-4 font-medium">Run</th>
+                          <th className="text-left py-2 pr-4 font-medium">Date</th>
+                          <th className="text-left py-2 pr-4 font-medium">Epochs</th>
+                          <th className="text-left py-2 pr-4 font-medium">Val Accuracy</th>
+                          <th className="text-left py-2 font-medium">Fine-tuned from</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {historyData.runs.map((run, i) => (
+                          <tr key={run.job_id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
+                            <td className="py-2 pr-4 text-gray-300 font-medium">Run {i + 1}</td>
+                            <td className="py-2 pr-4 text-gray-400">
+                              {run.started_at ? new Date(run.started_at).toLocaleDateString() : '—'}
+                            </td>
+                            <td className="py-2 pr-4 text-gray-400">{run.epochs_run}</td>
+                            <td className="py-2 pr-4">
+                              {run.final_val_acc != null
+                                ? <span className="text-green-400 font-medium">{(run.final_val_acc * 100).toFixed(1)}%</span>
+                                : <span className="text-gray-600">—</span>
+                              }
+                            </td>
+                            <td className="py-2 text-gray-500">
+                              {run.finetuned_from
+                                ? <span className="font-mono">{run.finetuned_from.slice(0, 8)}…</span>
+                                : '—'
+                              }
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Section 8: Model Comparison                                         */}
+      {/* ------------------------------------------------------------------ */}
+      <section className="mb-8">
+        <button
+          onClick={() => setShowCompare(c => !c)}
+          className="flex items-center gap-2 text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3 hover:text-gray-200 transition-colors"
+        >
+          <span>{showCompare ? '▾' : '▸'}</span>
+          Compare Models
+          {compareSelected.size > 0 && (
+            <span className="text-xs font-normal normal-case tracking-normal bg-blue-900/40 border border-blue-700 text-blue-300 px-2 py-0.5 rounded-full ml-1">
+              {compareSelected.size} selected
+            </span>
+          )}
+        </button>
+
+        {showCompare && (
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            {allJobs.length === 0 ? (
+              <p className="text-gray-500 text-sm">No trained models found. Train at least one model first.</p>
+            ) : (
+              <>
+                <p className="text-xs text-gray-500 mb-3">Select models to compare side-by-side:</p>
+
+                {/* Model checkboxes */}
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {allJobs.map(j => (
+                    <label
+                      key={j.job_id}
+                      className={`flex items-center gap-2 cursor-pointer rounded-lg px-3 py-1.5 border text-xs transition ${
+                        compareSelected.has(j.job_id)
+                          ? 'border-blue-500 bg-blue-900/20 text-blue-300'
+                          : 'border-gray-700 bg-gray-800 text-gray-400 hover:border-gray-600'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={compareSelected.has(j.job_id)}
+                        onChange={() => toggleCompareJob(j.job_id)}
+                        className="accent-blue-500"
+                      />
+                      {j.model_name || `Model ${j.job_id.slice(0, 8)}`}
+                      {j.final_val_acc != null && (
+                        <span className="text-gray-500">{(j.final_val_acc * 100).toFixed(1)}%</span>
+                      )}
+                    </label>
+                  ))}
+                </div>
+
+                {/* Comparison table */}
+                {compareSelected.size > 0 && (
+                  <CompareTable
+                    selectedIds={[...compareSelected]}
+                    allJobs={allJobs}
+                    compareData={compareData}
+                  />
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </section>
     </div>
   )
 }
@@ -645,6 +1186,116 @@ function ConfusionMatrix({ matrix, classNames }) {
               })}
             </tr>
           ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+
+// ---------------------------------------------------------------------------
+// CompareTable — side-by-side metrics for selected models
+// ---------------------------------------------------------------------------
+function CompareTable({ selectedIds, allJobs, compareData }) {
+  // Only show models whose results have been fetched
+  const ready = selectedIds.filter(id => compareData[id]?.final_metrics)
+  if (ready.length === 0) {
+    return <p className="text-gray-500 text-xs">Loading results…</p>
+  }
+
+  // Collect all class names across selected models (union)
+  const classSet = new Set()
+  ready.forEach(id => {
+    const cm = compareData[id]?.final_metrics
+    if (cm?.class_names) cm.class_names.forEach(c => classSet.add(c))
+  })
+  const classNames = [...classSet].sort()
+
+  // Build per-model metrics
+  const modelMetrics = ready.map(id => {
+    const job     = allJobs.find(j => j.job_id === id) || {}
+    const fm      = compareData[id]?.final_metrics || {}
+    const matrix  = fm.confusion_matrix
+    const classes = fm.class_names || []
+    const perClass = matrix ? computeMetrics(matrix, classes) : []
+
+    return {
+      id,
+      label:    job.model_name || `Model ${id.slice(0, 8)}`,
+      overall:  fm.final_val_acc != null ? (fm.final_val_acc * 100).toFixed(1) + '%' : '—',
+      perClass, // list of {name, precision, recall, f1}
+    }
+  })
+
+  // Build rows: Overall Accuracy, then per-class precision/recall/F1
+  const rows = [
+    {
+      metric: 'Overall Val Accuracy',
+      values: modelMetrics.map(m => ({ label: m.overall, highlight: true })),
+    },
+    ...classNames.flatMap(cls => [
+      {
+        metric: `${cls} — precision`,
+        values: modelMetrics.map(m => {
+          const entry = m.perClass.find(p => p.name === cls)
+          return { label: entry ? entry.precision.toFixed(3) : '—', highlight: false }
+        }),
+      },
+      {
+        metric: `${cls} — recall`,
+        values: modelMetrics.map(m => {
+          const entry = m.perClass.find(p => p.name === cls)
+          return { label: entry ? entry.recall.toFixed(3) : '—', highlight: false }
+        }),
+      },
+      {
+        metric: `${cls} — F1`,
+        values: modelMetrics.map(m => {
+          const entry = m.perClass.find(p => p.name === cls)
+          return { label: entry ? entry.f1.toFixed(3) : '—', highlight: false }
+        }),
+      },
+    ]),
+  ]
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-xs border-collapse">
+        <thead>
+          <tr className="text-gray-500 border-b border-gray-800">
+            <th className="text-left py-2 pr-6 font-medium min-w-32">Metric</th>
+            {modelMetrics.map(m => (
+              <th key={m.id} className="text-center py-2 px-4 font-medium text-gray-300">
+                {m.label}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => {
+            // Separate row for per-class grouping visual clarity
+            const isAccRow = row.metric === 'Overall Val Accuracy'
+            return (
+              <tr
+                key={i}
+                className={`border-b border-gray-800/50 ${isAccRow ? 'bg-gray-800/30' : 'hover:bg-gray-800/20'}`}
+              >
+                <td className={`py-2 pr-6 ${isAccRow ? 'text-gray-200 font-medium' : 'text-gray-500'}`}>
+                  {row.metric}
+                </td>
+                {row.values.map((v, j) => (
+                  <td
+                    key={j}
+                    className={`text-center py-2 px-4 font-mono ${
+                      v.highlight ? 'text-green-400 font-bold text-sm' : 'text-gray-300'
+                    }`}
+                  >
+                    {v.label}
+                  </td>
+                ))}
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>
