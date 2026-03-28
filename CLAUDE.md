@@ -724,8 +724,89 @@ Always start every new session with: **"Read CLAUDE.md before doing anything."**
 | 5 | ✅ Done | Dynamic CNN layer editor UI + model validation endpoint + layer shape display |
 | 6 | ✅ Done | Training results page (loss curves, accuracy, confusion matrix) — built in Session 4, confirmed complete |
 | 7 | ✅ Done | Inference engine + WebSocket stream-run + InferencePage UI (model selector, speed control, live prediction badge, confidence bars, history ribbon) |
-| **8** | **Next** | Export system (pipeline JSON, model weights, Python inference script) |
-| 9 | Upcoming | Polish — error handling, loading states, full README walkthrough |
+| 8 | ✅ Done | Export system (pipeline JSON, model weights, Python inference script) |
+| 9 | ✅ Done | UI polish — step reordering, session rename, sidebar progress dots, README |
+
+---
+
+## What Was Actually Built — Detailed Session Log
+
+### Session 8 — Export System
+
+**Goal:** Let users download everything they need to use their trained model outside of Neutrol.
+
+**Files created:**
+- `backend/core/export.py` — `generate_inference_script()` function. Takes a job_id and checkpoint dict, returns a complete standalone `.py` file as a string. The script embeds all model-builder code verbatim (same lazy-module pattern as `trainer.py`) so it has zero Neutrol dependency. Uses `{placeholders}` format string with `{{double braces}}` for literal braces inside the template.
+- `backend/api/export_routes.py` — Three endpoints:
+  - `GET /api/export/pipeline/{run_id}` → pipeline config as `.json` download
+  - `GET /api/export/model/{job_id}` → model weights as `.pt` download (FileResponse)
+  - `GET /api/export/script/{job_id}` → generated `.py` script (PlainTextResponse)
+  - All three use `response_model=None` on the decorator — required because `FileResponse | JSONResponse` is not a valid Pydantic type and FastAPI would fail to start otherwise.
+- `frontend/src/pages/ExportPage.jsx` — Two sections: Trained Models (class badges, accuracy, two download buttons per model) and Pipeline Configurations. Downloads triggered via programmatic `<a>` click with `target="_blank"` so the browser handles the Content-Disposition: attachment header correctly.
+
+**Bug fixes during Session 8:**
+- Removed `#!/usr/bin/env python3` shebang from generated script — breaks on Windows
+- `CHECKPOINT_PATH` in the script now uses the same filename as the downloaded `.pt` file (model_name stem), not the raw UUID. Previously the script hardcoded `{job_id}.pt` but the download was named after the model name, causing FileNotFoundError.
+- `pipeline_config` added to the run dict in `pipeline_routes.py` so the export endpoint has access to the full step config (not just step names)
+
+**Known limitation (not yet fixed):** The inference script does NOT apply preprocessing. It expects a pre-processed numpy array. The pipeline config is available in the checkpoint but the script doesn't use it yet. Future work: embed pipeline execution in the script so `predict(raw_window)` handles filtering automatically.
+
+---
+
+### Bug Fix — Training Always Showed 0 Labeled Windows
+
+**Root cause:** `trainer.py` called `store.labeled_data.get(session_id, [])` but `labeled_data` is keyed by `run_id`, not `session_id`. The fix adds a `run_id` parameter to `run_training()` and looks up by `run_id` when provided.
+
+**Files changed:**
+- `backend/core/trainer.py` — `run_training(job_id, session_id, model_config, run_id=None)`. When `run_id` is provided, uses `store.labeled_data.get(run_id, [])`. Falls back to session-wide scan only when `run_id` is None.
+- `backend/api/train_routes.py` — passes `run_id` as a kwarg to the background thread.
+- `backend/api/label_routes.py` — added `GET /api/labels/by-run/{run_id}` endpoint (must be defined before `GET /{session_id}` — FastAPI matches routes in order).
+- `frontend/src/pages/TrainPage.jsx` — `fetchLabelSummary` now takes explicit `runId` parameter to avoid stale closure race conditions. Uses `/api/labels/by-run/{run_id}` when a run is selected.
+
+---
+
+### Session 9 — UI Polish
+
+**Goal:** Make the app easier to use without touching backend logic.
+
+**Files changed:**
+
+`frontend/src/pages/PreprocessPage.jsx`:
+- Added `moveStepUp(idx)`, `moveStepDown(idx)`, `duplicateStep(idx)` functions
+- Each pipeline step card now has ↑ ↓ ⧉ ✕ buttons in the header row. ↑/↓ are disabled at the list boundaries.
+- "Clear all" button appears above the step list when steps exist
+- Improved no-session empty state with a link to the Import page
+
+`frontend/src/pages/ImportPage.jsx`:
+- Inline session rename: pencil icon (✎) next to each session name. Click → shows a text input pre-filled with current name. Enter commits, Escape cancels, blur commits.
+- Clicking anywhere on a session row makes it active (not just the "Set Active" button, which was removed)
+- Better upload error display with a Dismiss button
+- Spinner on upload and waveform loading
+
+`frontend/src/components/Sidebar.jsx`:
+- Step numbers 1–6 shown to the left of each nav label
+- Green dot appears next to a step when it's "done" (derived from Zustand state):
+  - Import: `currentSession !== null`
+  - Preprocess: `preprocessPageState.activeRunId !== null`
+  - Label: `labeledData.length > 0`
+  - Train: `trainingJob?.status === 'done'`
+- Active session filename shown at the bottom of the sidebar
+
+`frontend/src/store/appStore.js`:
+- Added `sessionNicknames: {}` — maps `session_id → string`
+- Added `setSessionNickname(sessionId, nickname)` action
+
+`README.md`:
+- Full rewrite covering quick start, all 6 workflow steps, preprocessing step table, inference script usage, and directory structure.
+
+---
+
+## Known Issues / Future Work
+
+- **Inference script does not preprocess**: `predict(window)` expects an already-preprocessed array. The pipeline config is saved in the checkpoint — the next logical step is to embed pipeline execution in the script so `predict(raw_window)` is truly end-to-end.
+- **Session nicknames reset on page refresh**: Stored in Zustand only, not persisted to the backend. Consistent with the in-memory backend model but worth noting.
+- **ICA step is slow**: On long recordings it can take minutes. No progress indicator or cancellation UI exists yet.
+- **No `.gitignore`**: The `exports/` and `backend/temp/` directories (containing user data and model weights) are currently tracked by git. A `.gitignore` should exclude these.
 
 ---
 
