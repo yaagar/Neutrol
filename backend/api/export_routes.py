@@ -27,7 +27,12 @@ import torch
 from fastapi import APIRouter
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
-from core.export import generate_inference_script
+from core.export import (
+    export_microcontroller,
+    export_onnx,
+    generate_inference_script,
+    generate_onnx_script,
+)
 from sessions.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -204,5 +209,189 @@ async def export_script(job_id: str) -> PlainTextResponse | JSONResponse:
     return PlainTextResponse(
         content=script_code,
         media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/export/onnx/{job_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/onnx/{job_id}", response_model=None)
+async def export_onnx_file(job_id: str) -> FileResponse | JSONResponse:
+    """
+    Export the trained model to ONNX format and return it as a file download.
+
+    ONNX (Open Neural Network Exchange) is a portable model format supported
+    by onnxruntime, TensorFlow, and many edge runtimes. Much smaller than a
+    PyTorch checkpoint because it only stores the computation graph and weights,
+    not the optimizer state or Python class definitions.
+
+    The exported .onnx file can be run with:
+      import onnxruntime as ort
+      sess = ort.InferenceSession("model.onnx")
+    """
+    job = store.training_jobs.get(job_id)
+    if job is None:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error=f"Training job '{job_id}' not found."),
+        )
+
+    if job.get("status") != "done":
+        return JSONResponse(
+            status_code=400,
+            content=api_response(False, error="Training has not completed yet."),
+        )
+
+    model_path = job.get("model_path")
+    if not model_path or not os.path.exists(model_path):
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error="Model file not found on disk."),
+        )
+
+    try:
+        onnx_path = export_onnx(job_id, model_path, EXPORTS_DIR)
+    except Exception as exc:
+        logger.error("ONNX export failed for job %s: %s", job_id, exc)
+        return JSONResponse(
+            status_code=500,
+            content=api_response(False, error=f"ONNX export failed: {exc}"),
+        )
+
+    model_name = job.get("model_name", "")
+    filename   = f"{(model_name or job_id[:8]).replace(' ', '_')}.onnx"
+
+    logger.info("Serving ONNX file for job %s: %s", job_id, onnx_path)
+
+    return FileResponse(
+        path=onnx_path,
+        media_type="application/octet-stream",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/export/onnx-script/{job_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/onnx-script/{job_id}", response_model=None)
+async def export_onnx_script_file(job_id: str) -> PlainTextResponse | JSONResponse:
+    """
+    Generate and download a standalone Python inference script that uses
+    onnxruntime instead of PyTorch.
+
+    The user should download this script alongside the .onnx file.
+    Only requires: numpy, scipy, onnxruntime  (no torch needed).
+    """
+    job = store.training_jobs.get(job_id)
+    if job is None:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error=f"Training job '{job_id}' not found."),
+        )
+
+    if job.get("status") != "done":
+        return JSONResponse(
+            status_code=400,
+            content=api_response(False, error="Training has not completed yet."),
+        )
+
+    model_path = job.get("model_path")
+    if not model_path or not os.path.exists(model_path):
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error="Model file not found — cannot generate script."),
+        )
+
+    try:
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        logger.error("Failed to load checkpoint for job %s: %s", job_id, exc)
+        return JSONResponse(
+            status_code=500,
+            content=api_response(False, error=f"Could not read model file: {exc}"),
+        )
+
+    model_name  = job.get("model_name", "")
+    script_code = generate_onnx_script(job_id, checkpoint, model_name)
+
+    filename = f"neutrol_onnx_{job_id[:8]}.py"
+    logger.info("Generated ONNX inference script for job %s (%d bytes)", job_id, len(script_code))
+
+    return PlainTextResponse(
+        content=script_code,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/export/microcontroller/{job_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/microcontroller/{job_id}", response_model=None)
+async def export_microcontroller_zip(job_id: str) -> FileResponse | JSONResponse:
+    """
+    Export the trained model as a microcontroller-ready ZIP package.
+
+    The ZIP contains:
+      - model_data.h          — TFLite model as a C byte array
+      - neutrol_inference.cpp — ESP32/Arduino inference code using TFLite Micro
+      - README_microcontroller.md — wiring and usage instructions
+
+    Requires tensorflow and onnx2tf (optional — returns a clear error if missing).
+    These are NOT in requirements.txt by default since they're large and optional.
+    Install with: pip install tensorflow onnx2tf
+    """
+    job = store.training_jobs.get(job_id)
+    if job is None:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error=f"Training job '{job_id}' not found."),
+        )
+
+    if job.get("status") != "done":
+        return JSONResponse(
+            status_code=400,
+            content=api_response(False, error="Training has not completed yet."),
+        )
+
+    model_path = job.get("model_path")
+    if not model_path or not os.path.exists(model_path):
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error="Model file not found on disk."),
+        )
+
+    try:
+        zip_path = export_microcontroller(job_id, model_path, EXPORTS_DIR)
+    except ImportError as exc:
+        return JSONResponse(
+            status_code=422,
+            content=api_response(
+                False,
+                error=f"Missing optional dependency: {exc}. "
+                      "Install with: pip install tensorflow onnx2tf onnx",
+            ),
+        )
+    except Exception as exc:
+        logger.error("Microcontroller export failed for job %s: %s", job_id, exc)
+        return JSONResponse(
+            status_code=500,
+            content=api_response(False, error=f"Microcontroller export failed: {exc}"),
+        )
+
+    model_name = job.get("model_name", "")
+    filename   = f"neutrol_micro_{(model_name or job_id[:8]).replace(' ', '_')}.zip"
+
+    logger.info("Serving microcontroller ZIP for job %s: %s", job_id, zip_path)
+
+    return FileResponse(
+        path=zip_path,
+        media_type="application/zip",
+        filename=filename,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

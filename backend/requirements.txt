@@ -7,3 +7,6 @@ torch
 scikit-learn
 python-multipart
 websockets
+onnx
+onnxruntime
+brainflow
