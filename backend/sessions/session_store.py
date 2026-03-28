@@ -55,4 +55,14 @@ class SessionStore:
             # Only one hardware device can be connected at a time.
             cls._instance.hardware_streamer = None
 
+            # OutputDispatcher — one shared instance that fans out predictions
+            # to external WebSocket clients and/or a serial port.
+            # Imported here to avoid circular imports; inference.py imports session_store indirectly.
+            from core.inference import OutputDispatcher
+            cls._instance.output_dispatcher: OutputDispatcher = OutputDispatcher()
+
+            # Persists the last output configuration the user applied so the
+            # frontend can show the current settings on page load.
+            cls._instance.output_config: dict = {}
+
         return cls._instance

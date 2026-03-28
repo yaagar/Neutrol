@@ -272,3 +272,173 @@ class HardwareStreamer:
             except Exception:
                 result.append({"name": name, "board_id": board_id})
         return result
+
+
+# ---------------------------------------------------------------------------
+# OutputDispatcher — fan-out predictions to external destinations
+# ---------------------------------------------------------------------------
+
+class OutputDispatcher:
+    """
+    Receives predictions and dispatches them to configured output destinations.
+
+    Two independent outputs (both optional, both can run simultaneously):
+      1. WebSocket server — Neutrol acts as a WS server on a configurable port.
+         External scripts connect as clients and receive predictions as JSON.
+         Best for Python, Node.js, or any language that supports WebSocket.
+
+      2. Serial port — sends a short string to a COM/USB serial port.
+         Best for Arduino, ESP32, or any microcontroller reading Serial.
+
+    Called after every prediction regardless of inference source
+    (simulated, file playback, or live hardware).
+
+    Usage:
+        dispatcher = OutputDispatcher()
+        await dispatcher.start_ws_server(8765)
+        dispatcher.start_serial("COM3", 9600, {"left": "L\\n", "right": "R\\n"})
+        await dispatcher.dispatch("left", 0.92)
+    """
+
+    def __init__(self) -> None:
+        self.ws_server: object | None = None   # asyncio WebSocket server
+        self.ws_clients: set           = set() # connected external WS clients
+        self.serial_conn: object | None = None  # pyserial Serial instance
+        self.serial_map: dict[str, str] = {}   # label → string to send
+        self.ws_port: int               = 8765
+        self.enabled_ws: bool           = False
+        self.enabled_serial: bool       = False
+
+    # ---- WebSocket server ----
+
+    async def start_ws_server(self, port: int) -> None:
+        """
+        Start a WebSocket server on the given port.
+
+        External clients connect to ws://localhost:{port} and receive
+        every prediction as: { "label": "left", "confidence": 0.87, "timestamp": ... }
+
+        We keep a set of connected clients and broadcast to all of them.
+        Clients that have disconnected are removed from the set silently.
+        """
+        try:
+            import websockets  # already in requirements.txt
+        except ImportError as exc:
+            raise ImportError("websockets is required for WS output") from exc
+
+        if self.ws_server is not None:
+            await self.stop_ws_server()
+
+        async def handler(websocket) -> None:
+            # Add this new external client to our broadcast set
+            self.ws_clients.add(websocket)
+            logger.info("Output WS client connected (total: %d)", len(self.ws_clients))
+            try:
+                # Keep the connection alive until the client disconnects
+                await websocket.wait_closed()
+            finally:
+                self.ws_clients.discard(websocket)
+                logger.info("Output WS client disconnected (total: %d)", len(self.ws_clients))
+
+        self.ws_server = await websockets.serve(handler, "0.0.0.0", port)
+        self.ws_port    = port
+        self.enabled_ws = True
+        logger.info("Output WebSocket server started on port %d", port)
+
+    async def stop_ws_server(self) -> None:
+        """Stop the WebSocket server and disconnect all clients."""
+        if self.ws_server:
+            self.ws_server.close()
+            await self.ws_server.wait_closed()
+            self.ws_server   = None
+            self.ws_clients.clear()
+            self.enabled_ws  = False
+            logger.info("Output WebSocket server stopped")
+
+    # ---- Serial port ----
+
+    def start_serial(self, port: str, baud: int, label_map: dict[str, str]) -> None:
+        """
+        Open a serial connection and configure the per-class message map.
+
+        Args:
+            port:      COM port string, e.g. "COM3" or "/dev/ttyUSB0".
+            baud:      Baud rate, e.g. 9600 or 115200.
+            label_map: Maps class label → string to send, e.g. {"left": "L\\n"}.
+                       The string is sent verbatim (\\n becomes an actual newline).
+        """
+        try:
+            import serial  # pyserial
+        except ImportError as exc:
+            raise ImportError(
+                "pyserial is required for serial output. Install with: pip install pyserial"
+            ) from exc
+
+        if self.serial_conn and self.serial_conn.is_open:
+            self.stop_serial()
+
+        self.serial_conn    = serial.Serial(port, baud, timeout=1)
+        # Interpret escape sequences in map values so "L\n" becomes "L" + newline
+        self.serial_map     = {k: v.encode("utf-8").decode("unicode_escape") for k, v in label_map.items()}
+        self.enabled_serial = True
+        logger.info("Serial output opened: port=%s baud=%d map=%s", port, baud, label_map)
+
+    def stop_serial(self) -> None:
+        """Close the serial connection."""
+        if self.serial_conn:
+            try:
+                self.serial_conn.close()
+            except Exception as exc:
+                logger.warning("Serial close error: %s", exc)
+            finally:
+                self.serial_conn    = None
+                self.enabled_serial = False
+                logger.info("Serial output closed")
+
+    # ---- Dispatch ----
+
+    async def dispatch(self, label: str, confidence: float) -> None:
+        """
+        Send a prediction to all enabled output destinations.
+
+        Called after every prediction in the inference WebSocket handlers.
+        Failures are logged but never propagate — a broken serial cable should
+        not interrupt the live inference stream.
+        """
+        import time
+        payload = {"label": label, "confidence": round(confidence, 4), "timestamp": int(time.time() * 1000)}
+
+        # Broadcast to all connected WebSocket clients
+        if self.enabled_ws and self.ws_clients:
+            import json
+            message = json.dumps(payload)
+            dead = set()
+            for client in list(self.ws_clients):
+                try:
+                    await client.send(message)
+                except Exception:
+                    # Client disconnected mid-stream — mark for removal
+                    dead.add(client)
+            self.ws_clients -= dead
+
+        # Send string to serial port
+        if self.enabled_serial and self.serial_conn and self.serial_conn.is_open:
+            text = self.serial_map.get(label, "")
+            if text:
+                try:
+                    self.serial_conn.write(text.encode("utf-8"))
+                except Exception as exc:
+                    logger.warning("Serial write error: %s", exc)
+
+    @property
+    def status(self) -> dict:
+        """Return a JSON-serialisable status snapshot for the API."""
+        return {
+            "ws_enabled":      self.enabled_ws,
+            "ws_port":         self.ws_port,
+            "ws_clients":      len(self.ws_clients),
+            "ws_running":      self.ws_server is not None,
+            "serial_enabled":  self.enabled_serial,
+            "serial_open":     bool(self.serial_conn and self.serial_conn.is_open),
+            "serial_map":      self.serial_map,
+        }

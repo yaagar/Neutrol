@@ -11,3 +11,4 @@ onnx
 onnxruntime
 onnxscript
 brainflow
+pyserial
