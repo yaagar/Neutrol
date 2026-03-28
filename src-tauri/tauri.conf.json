@@ -5,8 +5,7 @@
   "build": {
     "frontendDist": "../frontend/dist",
     "devUrl": "http://127.0.0.1:5173",
-    "beforeDevCommand": "cd frontend && npm run dev",
-    "beforeBuildCommand": "cd frontend && npm run build"
+    "beforeBuildCommand": "npm --prefix frontend run build"
   },
   "app": {
     "windows": [
@@ -25,9 +24,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": [],
-    "externalBin": [
-      "binaries/neutrol-backend"
-    ]
+    "icon": ["icons/icon.ico"]
   }
 }

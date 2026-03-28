@@ -65,7 +65,13 @@ app = FastAPI(
 # In production you would replace the origin with your actual domain name.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite's default dev server address
+    allow_origins=[
+        "http://localhost:5173",       # Vite dev server
+        "http://127.0.0.1:5173",       # Vite dev server (explicit IP)
+        "tauri://localhost",           # Tauri v2 webview (macOS/Linux)
+        "http://tauri.localhost",      # Tauri v2 webview (Windows)
+        "https://tauri.localhost",     # Tauri v2 webview (Windows, HTTPS variant)
+    ],
     allow_credentials=True,
     allow_methods=["*"],    # allow GET, POST, DELETE, PUT, OPTIONS, etc.
     allow_headers=["*"],    # allow all headers (Content-Type, Authorization, etc.)

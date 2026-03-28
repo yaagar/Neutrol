@@ -5,6 +5,10 @@ description = "Neutrol — Open-source EEG development platform"
 authors = []
 edition = "2021"
 
+[package.metadata.bundle]
+identifier = "com.neutrol.app"
+icon = ["icons/icon.ico"]
+
 # The lib target lets `tauri-build` generate the correct entry points.
 [lib]
 name = "neutrol_lib"
