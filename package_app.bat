@@ -46,8 +46,7 @@ echo.
 
 :: Step 2: Install frontend dependencies
 echo [2/3] Installing frontend dependencies...
-cd frontend
-call npm install
+call npm --prefix frontend install
 if %ERRORLEVEL% neq 0 (
     echo ERROR: npm install failed.
     pause
@@ -56,14 +55,14 @@ if %ERRORLEVEL% neq 0 (
 echo.
 
 :: Step 3: Build the Tauri app (builds frontend + packages everything)
+:: Must run from the project root so Tauri can find src-tauri/tauri.conf.json
 echo [3/3] Building Tauri desktop app...
-call npm run tauri build
+call frontend\node_modules\.bin\tauri build
 if %ERRORLEVEL% neq 0 (
     echo ERROR: Tauri build failed. See output above.
     pause
     exit /b 1
 )
-cd ..
 
 echo.
 echo ============================================================
