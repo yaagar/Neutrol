@@ -652,9 +652,55 @@ InferencePage output section: two `OutputCard` tiles, each with a `ToggleSwitch`
 |---|---|---|
 | P2-S1 | ✅ Done | Inference script preprocessing + ONNX + microcontroller export + BrainFlow backend |
 | P2-S2 | ✅ Done | InferencePage source toggle (Simulated/File Playback/Hardware) + Output system (WebSocket server + Serial port) |
-| **P2-S3** | **Next** | Fine-tuning training + model history + model comparison + data augmentation |
-| P2-S4 | Upcoming | PreprocessPage dashboard multi-graph view |
+| P2-S3 | ✅ Done | Fine-tuning training + model history + model comparison + data augmentation |
+| **P2-S4** | **Next** | PreprocessPage dashboard multi-graph view |
 | P2-S5 | Upcoming | Tauri desktop app conversion |
+
+---
+
+## Part 2 Session 3 — What Was Actually Built ✅
+
+### Fine-tuning
+
+**`backend/core/trainer.py`** — `run_training()` accepts two new optional params:
+- `finetune_from_job_id`: loads `{job_id}.pt` from exports/, validates classes match exactly, calls `model.load_state_dict()` before the training loop. Class mismatch → fail() with clear error. `finetuned_from` saved in checkpoint for traceability.
+- `augmentation_config`: passed to `augment_windows()` before train/val split.
+
+`augment_windows(X, y, config)` — expands training data `multiplier` times:
+- Gaussian noise: adds `strength × std` random normal per window
+- Time shift: `np.roll()` ±`max_shift_ratio × n_samples` time steps
+- Channel dropout: zeros one random channel per window copy
+- Returns `(X_aug, y_aug)` with shape `(N × multiplier, ch, samp)`
+
+**`backend/api/train_routes.py`** — two new endpoints:
+- `POST /api/train/finetune` — validates base model exists + class match up-front (instant error), then launches `run_training(finetune_from_job_id=...)`. Returns new `job_id` — base model unchanged.
+- `GET /api/train/history/{model_name}` — scans `store.training_jobs` for done jobs with matching `model_name`, returns sorted by `started_at` with val accuracy + `finetuned_from` chain.
+
+`StartTrainingRequest` updated to accept optional `augmentation_config`.
+
+### TrainPage UI
+
+**`frontend/src/pages/TrainPage.jsx`** — complete rewrite with new sections:
+
+**Training Mode toggle** — "Train from scratch" | "Fine-tune existing model":
+- Fine-tune mode: base model dropdown (all done jobs), compatibility message (✓ green / ✗ red), start button label changes to "Fine-tune"
+- Fine-tune result badge shows "Fine-tuned from model {id}…"
+
+**Augmentation section** (collapsible, "active" badge when any option on):
+- Gaussian Noise checkbox + strength input
+- Time Shift checkbox + max_shift_ratio input
+- Channel Dropout checkbox
+- Multiplier input (dataset size × N)
+
+**Model History section** (collapsible):
+- Model name text input + Load button
+- Val accuracy line chart across runs (Run 1 → Run N)
+- Table: Run | Date | Epochs | Val Accuracy | Fine-tuned from
+
+**Model Comparison section** (collapsible):
+- Checkbox list of all done models
+- Side-by-side table computed from confusion matrix: Overall Accuracy, per-class precision/recall/F1
+- Results fetched on-demand via `GET /api/train/{job_id}/results`
 
 ---
 
