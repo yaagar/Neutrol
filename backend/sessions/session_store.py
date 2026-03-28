@@ -51,4 +51,8 @@ class SessionStore:
             # Used by label_routes.py to auto-label windows from events.
             cls._instance.event_markers: dict = {}
 
+            # Single HardwareStreamer instance (or None when not connected).
+            # Only one hardware device can be connected at a time.
+            cls._instance.hardware_streamer = None
+
         return cls._instance
