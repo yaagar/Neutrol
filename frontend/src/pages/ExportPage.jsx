@@ -1,15 +1,13 @@
-// ExportPage.jsx — download trained models, pipeline configs, and inference scripts
+// ExportPage.jsx — download trained models, scripts, and pipeline configs
 //
-// Two sections:
-//   1. Trained Models — list of completed training jobs with download buttons for:
-//        - Model weights (.pt file)
-//        - Inference script (.py file, standalone, no Neutrol required)
-//   2. Pipeline Configs — list of pipeline runs with download buttons for:
-//        - Pipeline config (.json file, describes preprocessing steps)
+// Layout per trained model — four export cards:
+//   1. Python Script    — standalone .py + .pt, only needs numpy + torch
+//   2. ONNX Package     — .onnx + onnxruntime .py, no PyTorch needed
+//   3. Microcontroller  — ZIP with TFLite .h, ESP32 .cpp, README
+//   4. Pipeline Config  — preprocessing steps as .json
 //
-// Downloads are triggered by setting window.location.href to the API URL.
-// FastAPI responds with Content-Disposition: attachment which tells the browser
-// to save the file rather than display it.
+// Downloads are triggered via a hidden <a> element. FastAPI responds with
+// Content-Disposition: attachment, so the browser saves the file.
 import { useState, useEffect } from 'react'
 
 import { API_BASE_URL } from '../config'
@@ -20,7 +18,8 @@ export default function ExportPage() {
   const [runs, setRuns]           = useState([])
   const [jobsLoading, setJobsLoading] = useState(false)
   const [runsLoading, setRunsLoading] = useState(false)
-  const [downloading, setDownloading] = useState(null)  // 'model-{id}' | 'script-{id}' | 'pipeline-{id}'
+  // downloading tracks which button is active: e.g. 'model-{id}', 'onnx-{id}', etc.
+  const [downloading, setDownloading] = useState(null)
 
   useEffect(() => {
     fetchJobs()
@@ -33,10 +32,9 @@ export default function ExportPage() {
       const res  = await fetch(`${API}/api/train/jobs`)
       const json = await res.json()
       if (json.success) {
-        // Only show completed jobs — failed / running have no model file to download
         setJobs(json.data.jobs.filter(j => j.status === 'done'))
       }
-    } catch { /* ignore */ }
+    } catch { /* ignore — backend not running */ }
     finally { setJobsLoading(false) }
   }
 
@@ -51,18 +49,16 @@ export default function ExportPage() {
   }
 
   // Trigger a file download by navigating to the export endpoint.
-  // The backend sets Content-Disposition: attachment so the browser saves it.
+  // A hidden <a> with target="_blank" lets the browser handle the
+  // Content-Disposition: attachment header and save the file.
   function triggerDownload(url, key) {
     setDownloading(key)
-    // Use a temporary hidden <a> element so we get the filename from
-    // Content-Disposition (which window.open does not honour on all browsers).
     const a = document.createElement('a')
     a.href   = url
     a.target = '_blank'
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
-    // Reset the download state after a short delay
     setTimeout(() => setDownloading(null), 1500)
   }
 
@@ -73,7 +69,8 @@ export default function ExportPage() {
     <div className="max-w-4xl">
       <h1 className="text-2xl font-bold text-gray-100 mb-1">Export</h1>
       <p className="text-gray-400 text-sm mb-8">
-        Download your trained models, inference scripts, and pipeline configurations.
+        Download everything needed to use your model outside Neutrol.
+        Keep the script and model file in the same folder.
       </p>
 
       {/* ------------------------------------------------------------------ */}
@@ -104,7 +101,7 @@ export default function ExportPage() {
             </p>
           </div>
         ) : (
-          <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-4">
             {jobs.map(job => (
               <ModelCard
                 key={job.job_id}
@@ -115,6 +112,15 @@ export default function ExportPage() {
                 }
                 onDownloadScript={() =>
                   triggerDownload(`${API}/api/export/script/${job.job_id}`, `script-${job.job_id}`)
+                }
+                onDownloadOnnx={() =>
+                  triggerDownload(`${API}/api/export/onnx/${job.job_id}`, `onnx-${job.job_id}`)
+                }
+                onDownloadOnnxScript={() =>
+                  triggerDownload(`${API}/api/export/onnx-script/${job.job_id}`, `onnx-script-${job.job_id}`)
+                }
+                onDownloadMicro={() =>
+                  triggerDownload(`${API}/api/export/microcontroller/${job.job_id}`, `micro-${job.job_id}`)
                 }
               />
             ))}
@@ -170,28 +176,34 @@ export default function ExportPage() {
 
 
 // ---------------------------------------------------------------------------
-// ModelCard — one trained model with two download buttons
+// ModelCard — one trained model with four export format cards
 // ---------------------------------------------------------------------------
 
-function ModelCard({ job, downloading, onDownloadModel, onDownloadScript }) {
-  const modelKey  = `model-${job.job_id}`
-  const scriptKey = `script-${job.job_id}`
-
+function ModelCard({
+  job,
+  downloading,
+  onDownloadModel,
+  onDownloadScript,
+  onDownloadOnnx,
+  onDownloadOnnxScript,
+  onDownloadMicro,
+}) {
   const accuracy = job.final_val_acc != null
     ? `${(job.final_val_acc * 100).toFixed(1)}% val acc`
     : null
 
   const date = job.started_at
-    ? new Date(job.started_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+    ? new Date(job.started_at).toLocaleDateString(undefined, {
+        month: 'short', day: 'numeric', year: 'numeric',
+      })
     : null
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-      <div className="flex items-start justify-between gap-4">
-        {/* Left: model info */}
+      {/* Model header — name, classes, stats */}
+      <div className="flex items-start justify-between gap-4 mb-4">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
-            {/* Green dot = trained, ready to download */}
             <span className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0" />
             <p className="text-sm font-medium text-gray-100 truncate">
               {job.model_name || <span className="text-gray-500 italic">Unnamed model</span>}
@@ -201,9 +213,8 @@ function ModelCard({ job, downloading, onDownloadModel, onDownloadScript }) {
             </span>
           </div>
 
-          {/* Classes */}
           {job.classes?.length > 0 && (
-            <div className="flex flex-wrap gap-1 mb-2">
+            <div className="flex flex-wrap gap-1 mb-1">
               {job.classes.map(c => (
                 <span
                   key={c}
@@ -215,45 +226,155 @@ function ModelCard({ job, downloading, onDownloadModel, onDownloadScript }) {
             </div>
           )}
 
-          {/* Stats row */}
           <p className="text-xs text-gray-500">
             {[accuracy, date, `${job.epochs_run} epoch${job.epochs_run !== 1 ? 's' : ''}`]
               .filter(Boolean)
               .join(' · ')}
           </p>
         </div>
+      </div>
 
-        {/* Right: download buttons */}
-        <div className="flex flex-col gap-2 flex-shrink-0">
-          <DownloadButton
-            label="Model weights"
-            sublabel=".pt"
-            active={downloading === modelKey}
-            onClick={onDownloadModel}
-            color="purple"
-          />
-          <DownloadButton
-            label="Inference script"
-            sublabel=".py"
-            active={downloading === scriptKey}
-            onClick={onDownloadScript}
-            color="blue"
-          />
+      {/* Four export format cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+
+        {/* Card 1 — Python Script */}
+        <ExportFormatCard
+          title="Python Script"
+          badge=".py + .pt"
+          description="Standalone inference. Only needs numpy + torch. Call predict(window) on any raw window — preprocessing is embedded."
+          badgeColor="purple"
+          buttons={[
+            {
+              label: 'Model weights',
+              sublabel: '.pt',
+              key: `model-${job.job_id}`,
+              onClick: onDownloadModel,
+              color: 'gray',
+            },
+            {
+              label: 'Inference script',
+              sublabel: '.py',
+              key: `script-${job.job_id}`,
+              onClick: onDownloadScript,
+              color: 'purple',
+            },
+          ]}
+          downloading={downloading}
+        />
+
+        {/* Card 2 — ONNX */}
+        <ExportFormatCard
+          title="ONNX Package"
+          badge=".onnx + .py"
+          description="No PyTorch needed at runtime. Use onnxruntime — faster on CPU, deployable on edge devices, mobile, and web."
+          badgeColor="blue"
+          buttons={[
+            {
+              label: 'ONNX model',
+              sublabel: '.onnx',
+              key: `onnx-${job.job_id}`,
+              onClick: onDownloadOnnx,
+              color: 'gray',
+            },
+            {
+              label: 'ONNX script',
+              sublabel: '.py',
+              key: `onnx-script-${job.job_id}`,
+              onClick: onDownloadOnnxScript,
+              color: 'blue',
+            },
+          ]}
+          downloading={downloading}
+        />
+
+        {/* Card 3 — Microcontroller */}
+        <ExportFormatCard
+          title="Microcontroller"
+          badge=".zip"
+          description="TFLite C array + ESP32 Arduino sketch. Flash directly to a microcontroller. Requires tensorflow + onnx2tf."
+          badgeColor="green"
+          buttons={[
+            {
+              label: 'Download ZIP',
+              sublabel: '.zip',
+              key: `micro-${job.job_id}`,
+              onClick: onDownloadMicro,
+              color: 'green',
+            },
+          ]}
+          downloading={downloading}
+        />
+
+        {/* Card 4 — Pipeline JSON (links to pipeline runs section) */}
+        <ExportFormatCard
+          title="Pipeline Config"
+          badge=".json"
+          description="Preprocessing steps with all parameters. Load back into Neutrol or replay manually. See the Pipeline Configs section below."
+          badgeColor="yellow"
+          buttons={[]}
+          downloading={downloading}
+          footer={
+            <p className="text-xs text-gray-600 mt-1">
+              Download from the{' '}
+              <button
+                onClick={() => document.querySelector('section:last-of-type')?.scrollIntoView({ behavior: 'smooth' })}
+                className="text-yellow-500 hover:underline"
+              >
+                Pipeline Configurations
+              </button>{' '}
+              section below.
+            </p>
+          }
+        />
+      </div>
+    </div>
+  )
+}
+
+
+// ---------------------------------------------------------------------------
+// ExportFormatCard — one format tile inside a ModelCard
+// ---------------------------------------------------------------------------
+
+function ExportFormatCard({ title, badge, description, badgeColor, buttons, downloading, footer }) {
+  const badgeColors = {
+    purple: 'bg-purple-900/40 border-purple-700 text-purple-300',
+    blue:   'bg-blue-900/40   border-blue-700   text-blue-300',
+    green:  'bg-green-900/40  border-green-700  text-green-300',
+    yellow: 'bg-yellow-900/30 border-yellow-700 text-yellow-300',
+    gray:   'bg-gray-800      border-gray-700   text-gray-400',
+  }
+
+  return (
+    <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 flex flex-col gap-2">
+      {/* Title + badge */}
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium text-gray-200">{title}</span>
+        <span className={`text-xs px-1.5 py-0.5 rounded border font-mono ${badgeColors[badgeColor]}`}>
+          {badge}
+        </span>
+      </div>
+
+      {/* Description */}
+      <p className="text-xs text-gray-500 leading-relaxed">{description}</p>
+
+      {/* Download buttons */}
+      {buttons.length > 0 && (
+        <div className="flex flex-wrap gap-2 mt-auto">
+          {buttons.map(btn => (
+            <DownloadButton
+              key={btn.key}
+              label={btn.label}
+              sublabel={btn.sublabel}
+              active={downloading === btn.key}
+              onClick={btn.onClick}
+              color={btn.color}
+            />
+          ))}
         </div>
-      </div>
+      )}
 
-      {/* Inference script explanation */}
-      <div className="mt-3 pt-3 border-t border-gray-800">
-        <p className="text-xs text-gray-600">
-          The inference script is standalone — it only requires{' '}
-          <span className="font-mono text-gray-500">numpy</span> and{' '}
-          <span className="font-mono text-gray-500">torch</span>. Keep it in the same
-          folder as the .pt file and call{' '}
-          <span className="font-mono text-gray-500">predict(window)</span> with a preprocessed
-          numpy array of shape{' '}
-          <span className="font-mono text-gray-500">(n_channels, n_samples)</span>.
-        </p>
-      </div>
+      {footer}
     </div>
   )
 }
@@ -266,12 +387,13 @@ function ModelCard({ job, downloading, onDownloadModel, onDownloadScript }) {
 function PipelineCard({ run, downloading, onDownload }) {
   const key  = `pipeline-${run.run_id}`
   const date = run.created_at
-    ? new Date(run.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+    ? new Date(run.created_at).toLocaleDateString(undefined, {
+        month: 'short', day: 'numeric', year: 'numeric',
+      })
     : null
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex items-center justify-between gap-4">
-      {/* Left: run info */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
           <p className="text-sm font-medium text-gray-100 truncate">
@@ -282,14 +404,12 @@ function PipelineCard({ run, downloading, onDownload }) {
           </span>
         </div>
 
-        {/* Steps */}
         {run.steps_applied?.length > 0 && (
           <p className="text-xs text-gray-500 mb-1">
             {run.steps_applied.join(' → ')}
           </p>
         )}
 
-        {/* Stats */}
         <p className="text-xs text-gray-600">
           {[
             `${run.n_windows} windows`,
@@ -299,7 +419,6 @@ function PipelineCard({ run, downloading, onDownload }) {
         </p>
       </div>
 
-      {/* Right: download button */}
       <DownloadButton
         label="Pipeline config"
         sublabel=".json"
@@ -320,6 +439,8 @@ const COLOR_MAP = {
   purple: 'border-purple-700 bg-purple-900/20 hover:bg-purple-900/40 text-purple-300',
   blue:   'border-blue-700   bg-blue-900/20   hover:bg-blue-900/40   text-blue-300',
   green:  'border-green-700  bg-green-900/20  hover:bg-green-900/40  text-green-300',
+  yellow: 'border-yellow-700 bg-yellow-900/20 hover:bg-yellow-900/40 text-yellow-300',
+  gray:   'border-gray-700   bg-gray-800/60   hover:bg-gray-700/60   text-gray-300',
 }
 
 function DownloadButton({ label, sublabel, active, onClick, color = 'purple' }) {
