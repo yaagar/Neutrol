@@ -702,6 +702,21 @@ InferencePage output section: two `OutputCard` tiles, each with a `ToggleSwitch`
 - Side-by-side table computed from confusion matrix: Overall Accuracy, per-class precision/recall/F1
 - Results fetched on-demand via `GET /api/train/{job_id}/results`
 
+### Label Class Manager (hotfix after P2-S3)
+
+**Problem:** Fine-tuning gave "Class mismatch" errors because `'unknown'` labels in the current dataset were included in the class comparison.
+
+**Fixes:**
+- `backend/api/train_routes.py` — `/finetune` now filters `'unknown'` from `current_classes` before comparing against base model classes (consistent with how scratch training always excluded `'unknown'`).
+- `frontend/src/pages/LabelPage.jsx` — new **Class Manager** panel below the label summary:
+  - Shows each class with its window count as a removable chip
+  - Clicking × shows an inline confirmation: "Remove N windows? [Confirm] [Cancel]"
+  - On confirm: filters that class out of local `labels` state, then re-saves to backend
+  - Follows the MNE-Python standard: filter labels at the labeling stage, raw EEG data stays intact in the session
+  - Hint text explains the fine-tuning use case (why class lists must match)
+
+This is standard EEG practice: EEGLAB and MNE both filter event types at the epoch/labeling stage, not by deleting raw data.
+
 ---
 
 ## Known Issues
