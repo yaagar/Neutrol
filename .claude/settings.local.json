@@ -30,7 +30,10 @@
       "Bash(/dev/null sleep:*)",
       "Bash(cmd //c \"wmic process where \\\\\"ProcessId=36604\\\\\" get Name,CommandLine\")",
       "Bash(cmd //c \"tasklist /FI \\\\\"PID eq 36604\\\\\"\")",
-      "Bash(cmd //c 'taskkill /F /IM python.exe /IM python3.exe /IM uvicorn.exe')"
+      "Bash(cmd //c 'taskkill /F /IM python.exe /IM python3.exe /IM uvicorn.exe')",
+      "Bash(python:*)",
+      "Bash(tasklist /FI 'PID eq 49076')",
+      "Bash(gh repo:*)"
     ]
   }
 }
