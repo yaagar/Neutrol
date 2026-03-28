@@ -336,6 +336,18 @@ def run_training(job_id: str, session_id: str, model_config: dict, run_id: str |
         os.makedirs(EXPORTS_DIR, exist_ok=True)
         model_path = os.path.join(EXPORTS_DIR, f"{job_id}.pt")
 
+        # Fetch sample_rate and pipeline_config so the inference script can embed preprocessing.
+        # sample_rate comes from the session; pipeline_config from the pipeline run.
+        # Both may be None if the backend was restarted mid-session, which is acceptable —
+        # the inference script falls back to expecting a pre-processed window in that case.
+        session          = store.sessions.get(session_id)
+        sample_rate      = session.sample_rate if session else 256
+        pipeline_config  = None
+        if run_id:
+            run_entry = store.pipeline_runs.get(run_id, {})
+            if isinstance(run_entry, dict):
+                pipeline_config = run_entry.get("pipeline_config")
+
         # Save both weights and the config so we can reconstruct the model later
         torch.save({
             "model_state_dict": model.state_dict(),
@@ -345,6 +357,8 @@ def run_training(job_id: str, session_id: str, model_config: dict, run_id: str |
             "n_classes":        n_classes,
             "class_names":      classes,
             "trained_at":       datetime.now(timezone.utc).isoformat(),
+            "sample_rate":      sample_rate,
+            "pipeline_config":  pipeline_config,
         }, model_path)
 
         logger.info("Model saved to %s", model_path)
