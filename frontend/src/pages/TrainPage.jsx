@@ -86,6 +86,20 @@ export default function TrainPage() {
   const [compareSelected, setCompareSelected] = useState(new Set())
   const [compareData, setCompareData]       = useState({})  // job_id → results
 
+  // Manage models panel
+  const [showManage, setShowManage]         = useState(false)
+  const [inlineRename, setInlineRename]     = useState({})  // job_id → draft string
+  const [savingRename, setSavingRename]     = useState(null)  // job_id being saved
+  const [deletingJob, setDeletingJob]       = useState(null)  // job_id being deleted
+
+  // Model import panel
+  const [showImport, setShowImport]         = useState(false)
+  const [importFile, setImportFile]         = useState(null)
+  const [importName, setImportName]         = useState('')
+  const [importing, setImporting]           = useState(false)
+  const [importResult, setImportResult]     = useState(null)  // {job_id, model_name, class_names}
+  const [importError, setImportError]       = useState(null)
+
   const wsRef = useRef(null)
 
   // -------------------------------------------------------------------------
@@ -192,6 +206,71 @@ export default function TrainPage() {
         setAllJobs(json.data.jobs.filter(j => j.status === 'done'))
       }
     } catch { /* ignore */ }
+  }
+
+  // Rename any model by job_id (used in Manage Models list).
+  async function renameModelInline(jobId, newName) {
+    if (!newName.trim()) return
+    setSavingRename(jobId)
+    try {
+      const res  = await fetch(`${API}/api/train/${jobId}/name`, {
+        method:  'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ model_name: newName.trim() }),
+      })
+      const json = await res.json()
+      if (json.success) {
+        await fetchAllJobs()
+        // Clear the inline draft for this job
+        setInlineRename(prev => { const n = { ...prev }; delete n[jobId]; return n })
+      }
+    } catch { /* ignore */ } finally {
+      setSavingRename(null)
+    }
+  }
+
+  // Delete a model by job_id — removes from store + deletes .pt file.
+  async function deleteModel(jobId) {
+    setDeletingJob(jobId)
+    try {
+      const res  = await fetch(`${API}/api/train/${jobId}`, { method: 'DELETE' })
+      const json = await res.json()
+      if (json.success) {
+        await fetchAllJobs()
+        // Clear any state that referenced this job
+        if (baseJobId === jobId) setBaseJobId('')
+        setCompareSelected(prev => { const n = new Set(prev); n.delete(jobId); return n })
+      }
+    } catch { /* ignore */ } finally {
+      setDeletingJob(null)
+    }
+  }
+
+  // Import an external .pt model file into Neutrol's training job store.
+  // Sends a multipart/form-data upload to POST /api/train/import.
+  async function importModel() {
+    if (!importFile) return
+    setImporting(true)
+    setImportResult(null)
+    setImportError(null)
+    try {
+      const form = new FormData()
+      form.append('file', importFile)
+      form.append('model_name', importName || importFile.name.replace('.pt', ''))
+      const res  = await fetch(`${API}/api/train/import`, { method: 'POST', body: form })
+      const json = await res.json()
+      if (json.success) {
+        setImportResult(json.data)
+        // Refresh job list so the imported model appears in dropdowns immediately
+        await fetchAllJobs()
+      } else {
+        setImportError(json.error || 'Import failed.')
+      }
+    } catch (err) {
+      setImportError(`Network error: ${err.message}`)
+    } finally {
+      setImporting(false)
+    }
   }
 
   async function fetchLabelSummary(runId) {
@@ -1134,6 +1213,164 @@ export default function TrainPage() {
                   />
                 )}
               </>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Section 9: Manage Models — rename / delete                          */}
+      {/* ------------------------------------------------------------------ */}
+      <section className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <button
+          onClick={() => { setShowManage(v => !v); if (!showManage) fetchAllJobs() }}
+          className="w-full flex items-center justify-between px-5 py-3 text-sm font-semibold text-gray-300 hover:bg-gray-800 transition"
+        >
+          <span>{showManage ? '▾' : '▸'} Manage Models</span>
+          <span className="text-xs font-normal text-gray-500">Rename or delete trained models</span>
+        </button>
+
+        {showManage && (
+          <div className="px-5 py-4 border-t border-gray-800">
+            {allJobs.length === 0 ? (
+              <p className="text-xs text-gray-500">No trained models yet.</p>
+            ) : (
+              <div className="space-y-2">
+                {allJobs.map(j => {
+                  const displayName = j.model_name || `Model ${j.job_id.slice(0, 8)}`
+                  const draft       = inlineRename[j.job_id]  // undefined = not editing
+                  const isDeleting  = deletingJob === j.job_id
+                  const isSaving    = savingRename === j.job_id
+                  return (
+                    <div key={j.job_id} className="flex items-center gap-2 bg-gray-800 rounded-lg px-3 py-2">
+                      {/* Name — inline editable */}
+                      {draft !== undefined ? (
+                        <input
+                          type="text"
+                          value={draft}
+                          autoFocus
+                          onChange={e => setInlineRename(prev => ({ ...prev, [j.job_id]: e.target.value }))}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') renameModelInline(j.job_id, draft)
+                            if (e.key === 'Escape') setInlineRename(prev => { const n = { ...prev }; delete n[j.job_id]; return n })
+                          }}
+                          className="flex-1 bg-gray-700 border border-gray-600 text-gray-100 text-xs rounded px-2 py-1 focus:outline-none focus:border-purple-500"
+                        />
+                      ) : (
+                        <span className="flex-1 text-xs text-gray-200 truncate">{displayName}</span>
+                      )}
+
+                      {/* Acc badge */}
+                      {j.final_val_acc != null && (
+                        <span className="text-xs text-green-400 flex-shrink-0">{(j.final_val_acc * 100).toFixed(1)}%</span>
+                      )}
+                      {j.imported && (
+                        <span className="text-xs text-purple-400 flex-shrink-0">imported</span>
+                      )}
+
+                      {/* Rename / Save button */}
+                      {draft !== undefined ? (
+                        <button
+                          onClick={() => renameModelInline(j.job_id, draft)}
+                          disabled={isSaving}
+                          className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-40 px-1"
+                        >
+                          {isSaving ? '…' : 'Save'}
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => setInlineRename(prev => ({ ...prev, [j.job_id]: j.model_name || '' }))}
+                          title="Rename"
+                          className="text-xs text-gray-500 hover:text-gray-300 px-1"
+                        >
+                          ✎
+                        </button>
+                      )}
+
+                      {/* Delete button */}
+                      <button
+                        onClick={() => { if (window.confirm(`Delete "${displayName}"? This cannot be undone.`)) deleteModel(j.job_id) }}
+                        disabled={isDeleting}
+                        title="Delete model"
+                        className="text-xs text-gray-600 hover:text-red-400 disabled:opacity-40 px-1 transition-colors"
+                      >
+                        {isDeleting ? '…' : '✕'}
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Section 10: Import External Model (.pt)                             */}
+      {/* ------------------------------------------------------------------ */}
+      <section className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <button
+          onClick={() => setShowImport(v => !v)}
+          className="w-full flex items-center justify-between px-5 py-3 text-sm font-semibold text-gray-300 hover:bg-gray-800 transition"
+        >
+          <span>{showImport ? '▾' : '▸'} Import External Model (.pt)</span>
+          <span className="text-xs font-normal text-gray-500">Load a previously trained model</span>
+        </button>
+
+        {showImport && (
+          <div className="px-5 py-4 border-t border-gray-800 space-y-3">
+            <p className="text-xs text-gray-400">
+              Import a <code className="text-purple-300">.pt</code> checkpoint file exported from Neutrol (or any PyTorch model
+              saved with <code className="text-gray-400">torch.save()</code> that includes <code className="text-gray-400">model_state_dict</code> and <code className="text-gray-400">class_names</code> keys).
+              The model will appear in the Inference and Export pages immediately.
+            </p>
+
+            <div className="flex gap-3 flex-wrap items-end">
+              {/* File picker */}
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-gray-400">Model file (.pt)</label>
+                <input
+                  type="file"
+                  accept=".pt"
+                  onChange={e => { setImportFile(e.target.files[0] || null); setImportResult(null); setImportError(null) }}
+                  className="text-xs text-gray-300 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:bg-gray-700 file:text-gray-200 file:text-xs hover:file:bg-gray-600 cursor-pointer"
+                />
+              </div>
+
+              {/* Name input */}
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-gray-400">Model name (optional)</label>
+                <input
+                  type="text"
+                  placeholder="e.g. MyMotorModel"
+                  value={importName}
+                  onChange={e => setImportName(e.target.value)}
+                  className="bg-gray-800 border border-gray-700 text-gray-200 text-xs rounded px-3 py-1.5 focus:outline-none focus:border-purple-500 w-48"
+                />
+              </div>
+
+              {/* Import button */}
+              <button
+                onClick={importModel}
+                disabled={!importFile || importing}
+                className="bg-purple-700 hover:bg-purple-600 disabled:opacity-40 text-white text-xs font-medium rounded px-4 py-1.5 transition"
+              >
+                {importing ? 'Importing…' : 'Import Model'}
+              </button>
+            </div>
+
+            {/* Result */}
+            {importResult && (
+              <div className="bg-green-900/30 border border-green-700 rounded p-3 text-xs text-green-300">
+                <p className="font-semibold mb-1">Model imported successfully</p>
+                <p>Name: <span className="text-white">{importResult.model_name}</span></p>
+                <p>Classes: <span className="text-white">{importResult.class_names?.join(', ')}</span></p>
+                <p>Job ID: <code className="text-gray-400">{importResult.job_id?.slice(0, 8)}…</code></p>
+                <p className="mt-1 text-green-400">The model is now available in Inference and Export pages.</p>
+              </div>
+            )}
+            {importError && (
+              <p className="text-red-400 text-xs bg-red-900/20 rounded p-2">{importError}</p>
             )}
           </div>
         )}

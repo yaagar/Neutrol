@@ -125,6 +125,29 @@ LAYER_TYPES_SCHEMA: list[dict] = [
             {"name": "dropout",     "type": "float", "default": 0.0, "description": "Dropout between layers (only if num_layers > 1)"},
         ],
     },
+    {
+        "type": "CustomLayer",
+        "description": "User-defined PyTorch layer — paste your nn.Module class code",
+        "supports_activation": False,
+        "parameters": [
+            {
+                "name": "code",
+                "type": "code",
+                "default": (
+                    "class CustomLayer(nn.Module):\n"
+                    "    def __init__(self):\n"
+                    "        super().__init__()\n"
+                    "        # Add sub-layers here, e.g.:\n"
+                    "        # self.fc = nn.LazyLinear(64)\n\n"
+                    "    def forward(self, x):\n"
+                    "        # x shape depends on where this layer is placed.\n"
+                    "        # Return a tensor of any shape your next layer expects.\n"
+                    "        return x\n"
+                ),
+                "description": "Python class named 'CustomLayer' extending nn.Module",
+            },
+        ],
+    },
 ]
 
 ACTIVATION_OPTIONS: list[dict] = [
@@ -272,6 +295,28 @@ def _build_layer_modules(layer_cfg: dict, n_channels: int, n_classes: int) -> li
             num_layers=int(layer_cfg.get("num_layers", 1)),
             dropout=float(layer_cfg.get("dropout", 0.0)),
         ))
+
+    elif t == "CustomLayer":
+        # Execute the user's class definition in a sandboxed namespace.
+        # Only torch and nn are exposed — no file I/O or network access.
+        code = layer_cfg.get("code", "")
+        namespace: dict = {"nn": nn, "torch": torch}
+        try:
+            exec(code, namespace)  # noqa: S102  (exec is intentional — user-defined layer)
+        except Exception as exc:
+            raise ValueError(f"CustomLayer code error: {exc}") from exc
+
+        cls = namespace.get("CustomLayer")
+        if cls is None or not isinstance(cls, type):
+            raise ValueError(
+                "CustomLayer code must define a class named 'CustomLayer'."
+            )
+        if not issubclass(cls, nn.Module):
+            raise ValueError(
+                "CustomLayer class must extend nn.Module "
+                "(e.g. 'class CustomLayer(nn.Module):')."
+            )
+        modules.append(cls())
 
     else:
         raise ValueError(

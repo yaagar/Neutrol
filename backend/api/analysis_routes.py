@@ -24,6 +24,7 @@ from core.analysis import (
     compute_band_power,
     compute_fft,
     compute_psd,
+    compute_signal_stats,
     compute_spectrogram,
 )
 from sessions.session_store import SessionStore
@@ -246,6 +247,40 @@ async def spectrogram_endpoint(request: SpectrogramRequest) -> JSONResponse:
         return JSONResponse(
             status_code=500,
             content=api_response(False, error=f"Spectrogram computation failed: {exc}"),
+        )
+
+    return JSONResponse(status_code=200, content=api_response(True, data=data))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analysis/stats
+# ---------------------------------------------------------------------------
+
+@router.post("/stats")
+async def stats_endpoint(request: AnalysisRequest) -> JSONResponse:
+    """
+    Compute per-channel signal quality metrics.
+
+    Called by the Analyze button on PreprocessPage (Time tab).
+    Returns RMS, peak-to-peak, std, kurtosis, max_gradient, zero_crossing_rate
+    per channel, plus an artifact_warning flag for channels that look suspicious.
+    """
+    result = _get_signals(request.session_id, request.run_id)
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error=f"Session '{request.session_id}' not found."),
+        )
+
+    signals, sample_rate, channel_names = result
+
+    try:
+        data = compute_signal_stats(signals, sample_rate, channel_names)
+    except Exception as exc:
+        logger.error("Stats failed for session %s: %s", request.session_id, exc)
+        return JSONResponse(
+            status_code=500,
+            content=api_response(False, error=f"Stats computation failed: {exc}"),
         )
 
     return JSONResponse(status_code=200, content=api_response(True, data=data))

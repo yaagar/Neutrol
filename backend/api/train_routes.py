@@ -20,7 +20,10 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+import shutil
+import tempfile
+
+from fastapi import APIRouter, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -406,6 +409,50 @@ async def rename_model(job_id: str, request: RenameModelRequest) -> JSONResponse
 
 
 # ---------------------------------------------------------------------------
+# DELETE /api/train/{job_id} — delete a training job and its .pt checkpoint
+# ---------------------------------------------------------------------------
+
+@router.delete("/{job_id}")
+async def delete_model(job_id: str) -> JSONResponse:
+    """
+    Remove a training job from the in-memory store and delete its .pt file.
+
+    Used by the Manage Models UI so users can clean up old or unwanted models.
+    Running jobs cannot be deleted — stop them first.
+    """
+    job = store.training_jobs.get(job_id)
+    if job is None:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error=f"Training job '{job_id}' not found."),
+        )
+
+    if job.get("status") == "running":
+        return JSONResponse(
+            status_code=400,
+            content=api_response(False, error="Cannot delete a running training job. Wait for it to finish."),
+        )
+
+    # Remove the .pt checkpoint file if it exists
+    model_path = os.path.join(EXPORTS_DIR, f"{job_id}.pt")
+    if os.path.exists(model_path):
+        try:
+            os.remove(model_path)
+            logger.info("Deleted checkpoint: %s", model_path)
+        except OSError as exc:
+            logger.warning("Could not delete checkpoint file %s: %s", model_path, exc)
+
+    # Remove from in-memory store
+    del store.training_jobs[job_id]
+    logger.info("Deleted training job %s", job_id)
+
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={"deleted_job_id": job_id}),
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /api/train/finetune — start a fine-tuning job
 # ---------------------------------------------------------------------------
 
@@ -532,6 +579,114 @@ async def start_finetune(request: FinetuneRequest) -> JSONResponse:
             "base_job_id":  request.base_job_id,
         }),
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/train/import — import an externally trained .pt model file
+# ---------------------------------------------------------------------------
+
+@router.post("/import")
+async def import_model(
+    file: UploadFile,
+    model_name: str = Form("imported"),
+) -> JSONResponse:
+    """
+    Import an external .pt checkpoint file and register it as a training job.
+
+    This lets users bring in a model they trained outside of Neutrol (or in a
+    previous session) and use it directly for inference, export, or fine-tuning.
+
+    Required checkpoint keys: model_state_dict, class_names.
+    Optional (filled with defaults if missing): model_config, n_channels, n_samples.
+
+    The file is copied to exports/{job_id}.pt and a 'done' training_jobs entry
+    is created so the model appears in dropdowns immediately.
+    """
+    job_id = str(uuid.uuid4())
+
+    # Write the upload to a temp file so we can torch.load it for validation
+    suffix = ".pt"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        try:
+            checkpoint = torch.load(tmp_path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            return JSONResponse(
+                status_code=400,
+                content=api_response(False, error=f"Could not load .pt file: {exc}"),
+            )
+
+        # Validate minimum required keys
+        required = ["model_state_dict", "class_names"]
+        missing  = [k for k in required if k not in checkpoint]
+        if missing:
+            return JSONResponse(
+                status_code=400,
+                content=api_response(
+                    False,
+                    error=(
+                        f"Checkpoint is missing required keys: {missing}. "
+                        "A valid Neutrol checkpoint must contain 'model_state_dict' "
+                        "and 'class_names'."
+                    ),
+                ),
+            )
+
+        class_names  = checkpoint["class_names"]
+        ckpt_model_name = checkpoint.get("model_name", model_name) or model_name
+
+        # Copy validated checkpoint to exports directory
+        os.makedirs(EXPORTS_DIR, exist_ok=True)
+        dest_path = os.path.join(EXPORTS_DIR, f"{job_id}.pt")
+        shutil.copy2(tmp_path, dest_path)
+
+        # Build a training_jobs entry that matches what a native job produces.
+        # Status 'done' makes it immediately available in all dropdowns.
+        store.training_jobs[job_id] = {
+            "job_id":         job_id,
+            "session_id":     None,
+            "run_id":         None,
+            "model_name":     ckpt_model_name,
+            "model_config":   checkpoint.get("model_config", {}),
+            "class_names":    class_names,
+            "n_channels":     checkpoint.get("n_channels"),
+            "n_samples":      checkpoint.get("n_samples"),
+            "status":         "done",
+            "current_epoch":  checkpoint.get("epoch", 0),
+            "updates":        [],
+            "history":        [],
+            "model_path":     dest_path,
+            "started_at":     datetime.now(timezone.utc).isoformat(),
+            "finetuned_from": checkpoint.get("finetuned_from"),
+            "imported":       True,   # flag so UI can show "imported" badge
+        }
+
+        logger.info(
+            "Imported model '%s' as job %s (classes: %s)",
+            ckpt_model_name, job_id, class_names,
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content=api_response(True, data={
+                "job_id":      job_id,
+                "model_name":  ckpt_model_name,
+                "class_names": class_names,
+                "n_channels":  checkpoint.get("n_channels"),
+                "n_samples":   checkpoint.get("n_samples"),
+            }),
+        )
+
+    finally:
+        # Always clean up the temp file, even if an error occurred above
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------

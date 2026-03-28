@@ -82,6 +82,18 @@ const STEP_PRESETS = [
       { key: 'threshold_uv', label: 'Threshold (µV)', type: 'number', min: 1, step: 10 },
     ],
   },
+  {
+    label: 'Custom Step',
+    // code field handled specially in render (textarea, not a regular field)
+    config: {
+      step: 'custom',
+      name: 'Custom',
+      code: 'def process(signal, sample_rate):\n    # signal: (n_channels, n_samples)\n    # Return same shape\n    return signal\n',
+    },
+    fields: [
+      { key: 'name', label: 'Name', type: 'text' },
+    ],
+  },
 ]
 
 const ANALYSIS_TABS = [
@@ -117,6 +129,11 @@ export default function PreprocessPage() {
   const [spectrogramData, setSpectrogramData]   = useState(null)
   const [analysisLoading, setAnalysisLoading]   = useState(false)
   const [analysisError, setAnalysisError]       = useState(null)
+
+  // Signal quality stats (from Analyze button on Time tab)
+  const [statsData, setStatsData]       = useState(null)
+  const [statsLoading, setStatsLoading] = useState(false)
+  const [statsOpen, setStatsOpen]       = useState(false)  // collapsed by default
 
   // Dashboard view mode — 'tabs' shows one chart at a time, 'dashboard' shows 2×2 grid
   const [viewMode, setViewMode]     = useState('tabs')
@@ -282,6 +299,35 @@ export default function PreprocessPage() {
       setAnalysisError(`Network error: ${err.message}`)
     } finally {
       setAnalysisLoading(false)
+    }
+  }
+
+  // Fetch signal quality stats for the Analyze button (Time tab).
+  // Computes RMS, peak-to-peak, std, kurtosis, max_gradient, ZCR per channel.
+  async function fetchStats() {
+    if (!currentSession) return
+    setStatsLoading(true)
+    try {
+      const body = {
+        session_id: currentSession.session_id,
+        run_id: showRaw ? null : (activeRunId || null),
+      }
+      const res  = await fetch(`${API}/api/analysis/stats`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const json = await res.json()
+      if (json.success) {
+        setStatsData(json.data)
+        setStatsOpen(true)  // auto-expand when data arrives
+      } else {
+        setAnalysisError(json.error)
+      }
+    } catch (err) {
+      setAnalysisError(`Stats error: ${err.message}`)
+    } finally {
+      setStatsLoading(false)
     }
   }
 
@@ -537,7 +583,7 @@ export default function PreprocessPage() {
                         </select>
                       ) : (
                         <input
-                          type="number"
+                          type={field.type === 'text' ? 'text' : 'number'}
                           value={stepConfig[field.key] ?? ''}
                           min={field.min}
                           max={field.max}
@@ -548,6 +594,29 @@ export default function PreprocessPage() {
                       )}
                     </div>
                   ))}
+
+                  {/* Custom Step — Python code textarea */}
+                  {stepConfig.step === 'custom' && (
+                    <div className="mt-1">
+                      <p className="text-xs text-gray-400 mb-1 font-mono">
+                        Python code — <code className="text-yellow-300">def process(signal, sample_rate):</code>
+                      </p>
+                      <textarea
+                        value={stepConfig.code ?? ''}
+                        onChange={e => {
+                          const updated = [...pipelineSteps]
+                          updated[idx] = { ...updated[idx], code: e.target.value }
+                          setPreprocessPageState({ pipelineSteps: updated })
+                        }}
+                        rows={7}
+                        spellCheck={false}
+                        className="w-full bg-gray-900 border border-gray-600 text-green-300 text-xs font-mono rounded px-2 py-1.5 focus:outline-none focus:border-yellow-500 resize-y leading-relaxed"
+                      />
+                      <p className="text-xs text-gray-600 mt-0.5">
+                        Available: <code className="text-gray-400">np</code>, <code className="text-gray-400">scipy</code>. Signal shape: <code className="text-gray-400">(n_channels, n_samples)</code>.
+                      </p>
+                    </div>
+                  )}
 
                   {/* Channel Selector — visual checkbox list */}
                   {stepConfig.step === 'channels' && (
@@ -756,12 +825,13 @@ export default function PreprocessPage() {
               if (activeTab === 'frequency')   fetchPsd()
               if (activeTab === 'bandpower')   fetchBandPower()
               if (activeTab === 'spectrogram') fetchSpectrogram()
-              if (activeTab === 'time')        loadWaveform()
+              // Time tab: reload waveform AND compute signal quality stats
+              if (activeTab === 'time') { loadWaveform(); fetchStats() }
             }}
-            disabled={analysisLoading || Object.values(dashLoading).some(Boolean)}
+            disabled={analysisLoading || statsLoading || Object.values(dashLoading).some(Boolean)}
             className="ml-auto text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 rounded px-3 py-1"
           >
-            {(analysisLoading || Object.values(dashLoading).some(Boolean)) ? 'Loading…' : 'Analyze'}
+            {(analysisLoading || statsLoading || Object.values(dashLoading).some(Boolean)) ? 'Loading…' : 'Analyze'}
           </button>
         </div>
 
@@ -784,6 +854,67 @@ export default function PreprocessPage() {
                   <WaveformChart data={waveformData.points} channelNames={waveformData.channel_names} />
                 ) : (
                   <p className="text-gray-500 text-sm text-center mt-8">Loading waveform…</p>
+                )}
+
+                {/* Signal Quality Stats card — shown after clicking Analyze */}
+                {(statsData || statsLoading) && (
+                  <div className="mt-4 border border-gray-700 rounded-lg overflow-hidden">
+                    {/* Collapsible header */}
+                    <button
+                      onClick={() => setStatsOpen(o => !o)}
+                      className="w-full flex items-center justify-between px-4 py-2 bg-gray-700 hover:bg-gray-600 text-xs font-semibold text-gray-200 transition"
+                    >
+                      <span>Signal Quality Metrics {statsLoading && <span className="text-gray-400 font-normal ml-1">Computing…</span>}</span>
+                      <span className="text-gray-400">{statsOpen ? '▲' : '▼'}</span>
+                    </button>
+
+                    {statsOpen && statsData && (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="bg-gray-750 text-gray-400 border-b border-gray-700">
+                              <th className="text-left px-3 py-2">Channel</th>
+                              <th className="text-right px-3 py-2">RMS</th>
+                              <th className="text-right px-3 py-2">Peak-Peak</th>
+                              <th className="text-right px-3 py-2">Std Dev</th>
+                              <th className="text-right px-3 py-2" title="Pearson kurtosis (normal=3.0). >5 suggests spike artifacts.">Kurtosis</th>
+                              <th className="text-right px-3 py-2" title="Max sample-to-sample change — detects electrode pop-offs.">Max Grad</th>
+                              <th className="text-right px-3 py-2" title="Sign changes per second — frequency proxy.">ZCR/s</th>
+                              <th className="text-center px-3 py-2">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {statsData.channels.map((ch, i) => (
+                              <tr
+                                key={i}
+                                className={`border-b border-gray-800 ${ch.artifact_warning ? 'bg-red-950/30' : ''}`}
+                              >
+                                <td className="px-3 py-1.5 font-mono text-gray-200">{ch.channel}</td>
+                                <td className="px-3 py-1.5 text-right text-gray-300">{ch.rms.toFixed(3)}</td>
+                                <td className="px-3 py-1.5 text-right text-gray-300">{ch.peak_to_peak.toFixed(2)}</td>
+                                <td className="px-3 py-1.5 text-right text-gray-300">{ch.std.toFixed(3)}</td>
+                                <td className={`px-3 py-1.5 text-right font-mono ${ch.kurtosis > 5 ? 'text-red-400' : 'text-gray-300'}`}>
+                                  {ch.kurtosis.toFixed(2)}
+                                </td>
+                                <td className="px-3 py-1.5 text-right text-gray-300">{ch.max_gradient.toFixed(3)}</td>
+                                <td className="px-3 py-1.5 text-right text-gray-300">{ch.zero_crossing_rate.toFixed(1)}</td>
+                                <td className="px-3 py-1.5 text-center">
+                                  {ch.artifact_warning
+                                    ? <span className="text-red-400" title="Possible artifact — high kurtosis or large amplitude">⚠ Artifact?</span>
+                                    : <span className="text-green-400">✓</span>
+                                  }
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        <p className="text-xs text-gray-600 px-3 py-2">
+                          Kurtosis &gt; 5 or peak-to-peak &gt; 200 µV flags a channel for artifact review.
+                          Use Epoch Rejection or Channel Selector steps to exclude problematic channels.
+                        </p>
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
             )}

@@ -654,6 +654,7 @@ InferencePage output section: two `OutputCard` tiles, each with a `ToggleSwitch`
 | P2-S2 | ✅ Done | InferencePage source toggle (Simulated/File Playback/Hardware) + Output system (WebSocket server + Serial port) |
 | P2-S3 | ✅ Done | Fine-tuning training + model history + model comparison + data augmentation |
 | P2-S4 | ✅ Done | PreprocessPage dashboard multi-graph view |
+| P2-S4b | ✅ Done | Signal quality stats + Custom pipeline step + Custom CNN layer + Model import |
 | **P2-S5** | **Next** | Tauri desktop app conversion |
 
 ---
@@ -734,6 +735,64 @@ InferencePage output section: two `OutputCard` tiles, each with a `ToggleSwitch`
   - Hint text explains the fine-tuning use case (why class lists must match)
 
 This is standard EEG practice: EEGLAB and MNE both filter event types at the epoch/labeling stage, not by deleting raw data.
+
+---
+
+## Part 2 Session 4b — What Was Actually Built ✅
+
+### Signal Quality Stats (Analyze button — Time tab)
+
+**`backend/core/analysis.py`** — new `compute_signal_stats(signals, sample_rate, channel_names)`:
+- Per-channel: RMS, peak-to-peak, std, Pearson kurtosis (fisher=False, normal=3.0), max gradient (sample-to-sample), zero-crossing rate (sign changes/second)
+- `artifact_warning: True` when kurtosis > 5 (spike artifact threshold) or peak-to-peak > 200 µV
+- `scipy.stats.kurtosis` imported inside function (not at top-level)
+
+**`backend/api/analysis_routes.py`** — new `POST /api/analysis/stats` endpoint:
+- Body: `{session_id, run_id}` (same as other analysis endpoints)
+- Returns `{channels: [{channel, rms, peak_to_peak, std, kurtosis, max_gradient, zero_crossing_rate, artifact_warning}, ...]}}`
+
+**`frontend/src/pages/PreprocessPage.jsx`** — stats card below waveform on Time tab:
+- `fetchStats()` async function, `statsData`/`statsLoading`/`statsOpen` state
+- Analyze button on Time tab now calls both `loadWaveform()` + `fetchStats()`
+- Collapsible table with color-coded kurtosis column (red when > 5) and ⚠ Artifact? badge
+- Hint text links artifact warnings to Epoch Rejection / Channel Selector steps
+
+### Custom Pipeline Step
+
+**`backend/core/preprocessing.py`** — new `CustomStep(PreprocessingStep)` class:
+- `code` field: user-defined `def process(signal, sample_rate): return signal`
+- `exec()` in scoped namespace: `{'np': np, 'numpy': np, 'scipy': scipy_signal}`
+- Validates: function named `process` exists, returns `np.ndarray`, shape matches input exactly
+- Registered as `"custom"` in `STEP_REGISTRY` — auto-discovered by `/api/pipeline/steps`
+
+**`frontend/src/pages/PreprocessPage.jsx`** — new "Custom Step" in `STEP_PRESETS`:
+- Renders a multi-line code textarea (green-on-black font) when `stepConfig.step === 'custom'`
+- Name field lets user label the step; code field directly edits `stepConfig.code`
+
+### Custom CNN Layer
+
+**`backend/core/models.py`** — new `"CustomLayer"` in `LAYER_TYPES_SCHEMA`:
+- Parameter: `code` (type `"code"`) — user writes `class CustomLayer(nn.Module):`
+- `_build_layer_modules`: `exec(code, {'nn': nn, 'torch': torch})` → validates class exists and extends `nn.Module` → instantiates `CustomLayer()`
+
+**`frontend/src/components/ModelLayerEditor.jsx`** — new `"code"` type in `renderParamInput`:
+- Multi-line textarea with amber border, `font-mono`, dark background
+- Hint text shows available namespace (`nn`, `torch`) and required class name
+
+### Import External Model
+
+**`backend/api/train_routes.py`** — new `POST /api/train/import` endpoint:
+- `UploadFile` + `Form` — multipart upload; saves temp file, loads with `torch.load`
+- Validates: `model_state_dict` and `class_names` keys required
+- Copies validated checkpoint to `exports/{job_id}.pt`
+- Creates `store.training_jobs[job_id]` with `status: 'done'`, `imported: True` flag
+- Returns `{job_id, model_name, class_names, n_channels, n_samples}`
+- Temp file always cleaned up in `finally` block
+
+**`frontend/src/pages/TrainPage.jsx`** — new "Import External Model" collapsible section (Section 9):
+- File picker (`.pt` only) + optional name input + Import button
+- `importModel()` uses `FormData` for multipart upload
+- On success: shows green card with job_id/class_names; calls `fetchAllJobs()` to refresh dropdowns immediately
 
 ---
 

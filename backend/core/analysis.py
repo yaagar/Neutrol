@@ -267,3 +267,85 @@ def compute_spectrogram(
         "frequencies": f.tolist(),
         "power_db":    power_db.tolist(),   # 2D list [freq_idx][time_idx]
     }
+
+
+def compute_signal_stats(
+    signals: np.ndarray,
+    sample_rate: int,
+    channel_names: list[str] | None = None,
+) -> dict:
+    """
+    Compute per-channel signal quality metrics for the Analyze button.
+
+    These metrics are standard in EEG quality assessment pipelines:
+      - rms: Root mean square — overall signal power; very low = disconnected electrode
+      - peak_to_peak: max - min amplitude — high values indicate artifacts
+      - std: Standard deviation — signal variability around the mean
+      - kurtosis: 4th statistical moment (Pearson). Normal Gaussian = 3.0.
+                  > 5 strongly suggests spike artifacts (blinks, muscle bursts).
+                  < 2 suggests a flat/saturated channel.
+      - max_gradient: Maximum sample-to-sample change — detects electrode pop-offs
+                      (sudden large jumps in voltage).
+      - zero_crossing_rate: Sign changes per second — rough frequency proxy.
+                            High ZCR → high-frequency content.
+
+    Args:
+        signals:       Shape (n_channels, n_samples).
+        sample_rate:   Sampling frequency in Hz.
+        channel_names: Names for each channel row.
+
+    Returns:
+        {"channels": [{"channel": name, "rms": ..., "peak_to_peak": ...,
+                        "std": ..., "kurtosis": ..., "max_gradient": ...,
+                        "zero_crossing_rate": ..., "artifact_warning": bool}, ...]}
+    """
+    from scipy.stats import kurtosis as scipy_kurtosis
+
+    n_channels, n_samples = signals.shape
+    names = channel_names or [f"ch_{i}" for i in range(n_channels)]
+
+    results: list[dict] = []
+    for i, name in enumerate(names):
+        ch = signals[i].astype(np.float64)
+
+        # Root mean square: overall signal power.
+        rms = float(np.sqrt(np.mean(ch ** 2)))
+
+        # Peak-to-peak: amplitude range. Large values indicate artifact spikes.
+        peak_to_peak = float(np.max(ch) - np.min(ch))
+
+        # Standard deviation: variability around the mean.
+        std = float(np.std(ch))
+
+        # Pearson kurtosis (fisher=False so normal distribution = 3.0).
+        # kurtosis > 5 is common artifact threshold in EEG preprocessing.
+        kurt = float(scipy_kurtosis(ch, fisher=False))
+
+        # Max gradient: largest sample-to-sample change in absolute value.
+        # Detects sudden jumps from electrode pop-off or clipping.
+        diff = np.diff(ch)
+        max_gradient = float(np.max(np.abs(diff))) if len(diff) > 0 else 0.0
+
+        # Zero crossing rate: sign changes per second.
+        # Count where consecutive samples change sign (positive↔negative).
+        signs = np.sign(ch)
+        crossings = int(np.sum(np.diff(signs) != 0))
+        zcr = crossings / (n_samples / sample_rate)
+
+        # Flag likely artifact channels: high kurtosis OR very large amplitude.
+        # Thresholds are conservative — flag for review, not hard rejection.
+        artifact_warning = (kurt > 5.0) or (peak_to_peak > 200.0)
+
+        results.append({
+            "channel":            name,
+            "rms":                round(rms, 4),
+            "peak_to_peak":       round(peak_to_peak, 4),
+            "std":                round(std, 4),
+            "kurtosis":           round(kurt, 4),
+            "max_gradient":       round(max_gradient, 4),
+            "zero_crossing_rate": round(zcr, 2),
+            "artifact_warning":   artifact_warning,
+        })
+
+    logger.debug("Signal stats computed: %d channels", n_channels)
+    return {"channels": results}

@@ -27,6 +27,7 @@ const LAYER_COLORS = {
   Flatten:         'border-gray-400',
   Linear:          'border-purple-500',
   LSTM:            'border-pink-500',
+  CustomLayer:     'border-amber-500',
 }
 
 // Default parameters to fill in when adding a new layer of a given type
@@ -212,6 +213,26 @@ export default function ModelLayerEditor({
             }}
             className="w-24 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-purple-500"
           />
+        </div>
+      )
+    }
+
+    // code — multi-line textarea for user-pasted Python code (CustomLayer, CustomStep)
+    if (type === 'code') {
+      return (
+        <div key={name} className="flex flex-col gap-1 w-full">
+          <span className="text-xs text-gray-500 font-mono">Python code</span>
+          <textarea
+            value={currentValue ?? ''}
+            onChange={e => updateLayer(layerIndex, { [name]: e.target.value })}
+            rows={10}
+            spellCheck={false}
+            className="w-full bg-gray-950 border border-gray-700 rounded px-3 py-2 text-xs text-green-300 font-mono focus:outline-none focus:border-amber-500 resize-y leading-relaxed"
+            placeholder="class CustomLayer(nn.Module):&#10;    def __init__(self):&#10;        super().__init__()&#10;&#10;    def forward(self, x):&#10;        return x"
+          />
+          <span className="text-xs text-gray-600">
+            Class must be named <code className="text-amber-400">CustomLayer</code> and extend <code className="text-amber-400">nn.Module</code>. Available: <code className="text-gray-400">nn</code>, <code className="text-gray-400">torch</code>.
+          </span>
         </div>
       )
     }

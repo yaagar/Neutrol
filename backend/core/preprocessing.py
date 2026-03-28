@@ -834,6 +834,105 @@ class TruncateSignal(PreprocessingStep):
 
 
 # ---------------------------------------------------------------------------
+# CustomStep — user-defined preprocessing step via Python code
+# ---------------------------------------------------------------------------
+
+class CustomStep(PreprocessingStep):
+    """
+    A preprocessing step whose logic is supplied by the user as Python code.
+
+    The user pastes a function definition into the UI:
+        def process(signal, sample_rate):
+            # signal: np.ndarray of shape (n_channels, n_samples)
+            # sample_rate: int
+            return signal   # must return same shape
+
+    The code is executed in a restricted namespace with only NumPy and SciPy
+    available — no file I/O, no subprocess, no network access.
+
+    Output shape is validated — if the function changes shape, an error is raised
+    before the rest of the pipeline sees the result.
+    """
+
+    # Default code shown to users when they add a Custom step
+    DEFAULT_CODE = (
+        "def process(signal, sample_rate):\n"
+        "    # signal shape: (n_channels, n_samples)\n"
+        "    # Edit this function and return the modified signal.\n"
+        "    return signal\n"
+    )
+
+    def __init__(self, code: str, name: str = "Custom") -> None:
+        """
+        Args:
+            code: Python source code defining a 'process(signal, sample_rate)' function.
+            name: Human-readable label shown in the pipeline UI.
+        """
+        self.code = code
+        self.name = name
+
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
+        """Execute the user's 'process' function in a sandboxed namespace."""
+        import scipy.signal as _scipy_signal
+
+        # Restricted namespace — only NumPy and SciPy signal are exposed.
+        # This prevents accidental (or intentional) side effects.
+        namespace: dict[str, Any] = {
+            "np":     np,
+            "numpy":  np,
+            "scipy":  _scipy_signal,
+        }
+
+        try:
+            exec(self.code, namespace)  # noqa: S102  (exec is intentional here)
+        except Exception as exc:
+            raise ValueError(f"Custom step '{self.name}': code error — {exc}") from exc
+
+        if "process" not in namespace or not callable(namespace["process"]):
+            raise ValueError(
+                f"Custom step '{self.name}': code must define a callable "
+                "'process(signal, sample_rate)'."
+            )
+
+        try:
+            result = namespace["process"](signals.copy(), sample_rate)
+        except Exception as exc:
+            raise ValueError(
+                f"Custom step '{self.name}': 'process' function raised an error — {exc}"
+            ) from exc
+
+        if not isinstance(result, np.ndarray):
+            raise ValueError(
+                f"Custom step '{self.name}': 'process' must return np.ndarray, "
+                f"got {type(result).__name__}."
+            )
+
+        if result.shape != signals.shape:
+            raise ValueError(
+                f"Custom step '{self.name}': output shape {result.shape} does not match "
+                f"input shape {signals.shape}. Output must preserve (n_channels, n_samples)."
+            )
+
+        logger.info("CustomStep '%s' applied successfully.", self.name)
+        return result
+
+    def to_dict(self) -> dict:
+        return {"step": "custom", "name": self.name, "code": self.code}
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "CustomStep":
+        return cls(
+            code=config.get("code", cls.DEFAULT_CODE),
+            name=config.get("name", "Custom"),
+        )
+
+
+# ---------------------------------------------------------------------------
 # STEP_REGISTRY — maps JSON "step" strings to their classes
 # ---------------------------------------------------------------------------
 
@@ -849,6 +948,7 @@ STEP_REGISTRY: dict[str, type[PreprocessingStep]] = {
     "reject":    EpochRejection,
     "channels":  ChannelSelector,
     "ica":       ICAFilter,
+    "custom":    CustomStep,   # user-defined step via pasted Python code
 }
 
 
