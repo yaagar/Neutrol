@@ -10,6 +10,7 @@
 //   gray   — not yet reached
 import { NavLink } from 'react-router-dom'
 import useAppStore from '../store/appStore'
+import PipelineProgress from './PipelineProgress'
 
 const NAV_ITEMS = [
   { label: 'Import',     path: '/import',     step: 1 },
@@ -45,8 +46,11 @@ export default function Sidebar() {
         <p className="text-xs text-gray-500 mt-1">EEG Development Platform</p>
       </div>
 
+      {/* Pipeline progress indicator */}
+      <PipelineProgress />
+
       {/* Navigation links */}
-      <ul className="flex flex-col gap-1">
+      <ul className="flex flex-col gap-1 mt-2">
         {NAV_ITEMS.map(({ label, path, step }) => (
           <li key={path}>
             <NavLink

@@ -91,7 +91,7 @@ async def run_pipeline(request: RunPipelineRequest) -> JSONResponse:
         )
 
     try:
-        windows = pipeline.run(session)
+        windows, final_sample_rate = pipeline.run(session)
     except Exception as exc:
         logger.error("Pipeline run failed for session %s: %s", request.session_id, exc)
         return JSONResponse(
@@ -115,21 +115,23 @@ async def run_pipeline(request: RunPipelineRequest) -> JSONResponse:
     # Store as a dict (not a tuple) so /runs and /runs/{id}/window/{i} can read metadata
     # without loading all the numpy arrays into the response.
     # pipeline_config is stored so the export system can produce a downloadable JSON.
+    # final_sample_rate may differ from session.sample_rate if ResampleStep was applied.
     store.pipeline_runs[run_id] = {
-        "session_id":       request.session_id,
-        "name":             request.name,
-        "windows":          windows,           # list[np.ndarray] — never sent over API
-        "n_windows":        len(windows),
-        "window_shape":     window_shape,
-        "steps_applied":    steps_applied,
-        "pipeline_config":  request.pipeline_config,   # full config for export
+        "session_id":        request.session_id,
+        "name":              request.name,
+        "windows":           windows,           # list[np.ndarray] — never sent over API
+        "n_windows":         len(windows),
+        "window_shape":      window_shape,
+        "steps_applied":     steps_applied,
+        "pipeline_config":   request.pipeline_config,   # full config for export
         "signal_offset_sec": signal_offset_sec,
-        "created_at":       datetime.now(timezone.utc).isoformat(),
+        "sample_rate":       final_sample_rate,  # may differ after ResampleStep
+        "created_at":        datetime.now(timezone.utc).isoformat(),
     }
 
     logger.info(
-        "Pipeline run %s ('%s'): %d windows of shape %s for session %s",
-        run_id, request.name, len(windows), window_shape, request.session_id,
+        "Pipeline run %s ('%s'): %d windows of shape %s for session %s (sample_rate=%d)",
+        run_id, request.name, len(windows), window_shape, request.session_id, final_sample_rate,
     )
 
     return JSONResponse(
@@ -141,6 +143,7 @@ async def run_pipeline(request: RunPipelineRequest) -> JSONResponse:
             "window_shape":      window_shape,
             "steps_applied":     steps_applied,
             "signal_offset_sec": signal_offset_sec,
+            "sample_rate":       final_sample_rate,
         }),
     )
 

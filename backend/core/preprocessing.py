@@ -25,7 +25,8 @@ import uuid
 from typing import Any
 
 import numpy as np
-from scipy.signal import butter, iirnotch, sosfiltfilt
+from math import gcd
+from scipy.signal import butter, iirnotch, sosfiltfilt, cheby1, cheby2, bessel, firwin, lfilter, resample_poly
 
 from core.data_loader import DataSession
 
@@ -225,6 +226,187 @@ class NotchFilter(PreprocessingStep):
         return cls(
             freq_hz=config["freq_hz"],
             quality_factor=config.get("quality_factor", cls.DEFAULT_QUALITY_FACTOR),
+        )
+
+
+# ---------------------------------------------------------------------------
+# HighpassFilter — remove low-frequency drift below a cutoff
+# ---------------------------------------------------------------------------
+
+class HighpassFilter(PreprocessingStep):
+    """
+    Zero-phase high-pass filter.
+
+    Removes slow drift, DC offset, and low-frequency noise below the cutoff.
+    Common cutoff: 1 Hz for EEG (removes electrode sweat potentials without
+    disturbing delta-band activity), or 0.1 Hz for very slow potentials.
+
+    Supported filter types:
+      'butterworth' (default) — maximally flat passband, standard for EEG.
+      'chebyshev1' — steeper rolloff but ripple in the passband.
+      'chebyshev2' — ripple in the stopband only, flatter passband than cheby1.
+      'bessel' — maximally linear phase (best for ERPs where timing matters).
+
+    Why configurable filter type?
+      Butterworth is the best default but researchers studying event-related
+      potentials (ERPs) often prefer Bessel filters because the linear phase
+      response preserves the exact timing of ERP components like P300 and N200.
+    """
+
+    DEFAULT_ORDER = 4
+
+    def __init__(
+        self,
+        cutoff_hz: float,
+        filter_type: str = "butterworth",
+        order: int = DEFAULT_ORDER,
+    ) -> None:
+        """
+        Args:
+            cutoff_hz:   High-pass cutoff in Hz — frequencies below this are removed.
+            filter_type: 'butterworth', 'chebyshev1', 'chebyshev2', or 'bessel'.
+            order:       Filter order. Higher = sharper rolloff but more ringing.
+        """
+        VALID = {"butterworth", "chebyshev1", "chebyshev2", "bessel"}
+        if filter_type not in VALID:
+            raise ValueError(f"Unknown filter_type '{filter_type}'. Valid: {sorted(VALID)}")
+        if cutoff_hz <= 0:
+            raise ValueError(f"cutoff_hz must be positive, got {cutoff_hz}")
+        if order < 1:
+            raise ValueError(f"order must be ≥ 1, got {order}")
+        self.cutoff_hz   = cutoff_hz
+        self.filter_type = filter_type
+        self.order       = order
+
+    def _design_sos(self, sample_rate: int):
+        """Design the filter and return second-order sections."""
+        fn = self.cutoff_hz / (sample_rate / 2.0)  # normalised cutoff (0–1)
+        fn = min(fn, 0.99)  # guard against Nyquist overflow
+
+        if self.filter_type == "butterworth":
+            return butter(self.order, fn, btype="high", output="sos")
+        elif self.filter_type == "chebyshev1":
+            return cheby1(self.order, rp=0.5, Wn=fn, btype="high", output="sos")
+        elif self.filter_type == "chebyshev2":
+            return cheby2(self.order, rs=40, Wn=fn, btype="high", output="sos")
+        elif self.filter_type == "bessel":
+            return bessel(self.order, fn, btype="high", output="sos", norm="phase")
+
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
+        """Apply the high-pass filter to every channel independently."""
+        sos = self._design_sos(sample_rate)
+        filtered = np.zeros_like(signals)
+        for i, channel in enumerate(signals):
+            filtered[i] = sosfiltfilt(sos, channel)
+        return filtered
+
+    def to_dict(self) -> dict:
+        return {
+            "step":        "highpass",
+            "cutoff_hz":   self.cutoff_hz,
+            "filter_type": self.filter_type,
+            "order":       self.order,
+        }
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "HighpassFilter":
+        return cls(
+            cutoff_hz=config["cutoff_hz"],
+            filter_type=config.get("filter_type", "butterworth"),
+            order=int(config.get("order", cls.DEFAULT_ORDER)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# LowpassFilter — remove high-frequency noise above a cutoff
+# ---------------------------------------------------------------------------
+
+class LowpassFilter(PreprocessingStep):
+    """
+    Zero-phase low-pass filter.
+
+    Removes high-frequency noise and muscle (EMG) artifacts above the cutoff.
+    Common cutoff: 40 Hz (removes EMG while keeping all EEG bands),
+    or 100 Hz when gamma-band analysis is needed.
+
+    Supported filter types: same as HighpassFilter (butterworth, chebyshev1,
+    chebyshev2, bessel). Butterworth is the default.
+
+    This is particularly useful as an anti-aliasing filter before downsampling,
+    and for rejecting EMG artifacts in motor-imagery BCIs.
+    """
+
+    DEFAULT_ORDER = 4
+
+    def __init__(
+        self,
+        cutoff_hz: float,
+        filter_type: str = "butterworth",
+        order: int = DEFAULT_ORDER,
+    ) -> None:
+        """
+        Args:
+            cutoff_hz:   Low-pass cutoff in Hz — frequencies above this are removed.
+            filter_type: 'butterworth', 'chebyshev1', 'chebyshev2', or 'bessel'.
+            order:       Filter order. Higher = sharper rolloff.
+        """
+        VALID = {"butterworth", "chebyshev1", "chebyshev2", "bessel"}
+        if filter_type not in VALID:
+            raise ValueError(f"Unknown filter_type '{filter_type}'. Valid: {sorted(VALID)}")
+        if cutoff_hz <= 0:
+            raise ValueError(f"cutoff_hz must be positive, got {cutoff_hz}")
+        if order < 1:
+            raise ValueError(f"order must be ≥ 1, got {order}")
+        self.cutoff_hz   = cutoff_hz
+        self.filter_type = filter_type
+        self.order       = order
+
+    def _design_sos(self, sample_rate: int):
+        """Design the filter and return second-order sections."""
+        fn = self.cutoff_hz / (sample_rate / 2.0)
+        fn = min(fn, 0.99)
+
+        if self.filter_type == "butterworth":
+            return butter(self.order, fn, btype="low", output="sos")
+        elif self.filter_type == "chebyshev1":
+            return cheby1(self.order, rp=0.5, Wn=fn, btype="low", output="sos")
+        elif self.filter_type == "chebyshev2":
+            return cheby2(self.order, rs=40, Wn=fn, btype="low", output="sos")
+        elif self.filter_type == "bessel":
+            return bessel(self.order, fn, btype="low", output="sos", norm="phase")
+
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
+        """Apply the low-pass filter to every channel independently."""
+        sos = self._design_sos(sample_rate)
+        filtered = np.zeros_like(signals)
+        for i, channel in enumerate(signals):
+            filtered[i] = sosfiltfilt(sos, channel)
+        return filtered
+
+    def to_dict(self) -> dict:
+        return {
+            "step":        "lowpass",
+            "cutoff_hz":   self.cutoff_hz,
+            "filter_type": self.filter_type,
+            "order":       self.order,
+        }
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "LowpassFilter":
+        return cls(
+            cutoff_hz=config["cutoff_hz"],
+            filter_type=config.get("filter_type", "butterworth"),
+            order=int(config.get("order", cls.DEFAULT_ORDER)),
         )
 
 
@@ -834,6 +1016,78 @@ class TruncateSignal(PreprocessingStep):
 
 
 # ---------------------------------------------------------------------------
+# ResampleStep — change the sample rate of the signal
+# ---------------------------------------------------------------------------
+
+class ResampleStep(PreprocessingStep):
+    """
+    Resample the signal to a new sample rate using polyphase filtering.
+
+    Resampling is useful when:
+      - Your device records at 512 Hz but your model was trained at 256 Hz.
+      - You want to reduce data size before windowing (lower sample rate → fewer
+        samples per window → faster training and inference).
+      - You need to match the sample rate of a reference dataset.
+
+    Uses scipy.signal.resample_poly (polyphase filtering) which avoids floating-
+    point ratio errors and doesn't require the up/down factors to be integers
+    directly — the GCD is used to simplify the ratio.
+
+    IMPORTANT: Place AFTER filtering steps (bandpass, notch) and BEFORE windowing.
+    If placed before filtering, the filter cutoffs will be relative to the wrong
+    sample rate.
+    """
+
+    VALID_RATES = (64, 128, 256, 512, 1000, 2048)
+
+    def __init__(self, target_rate_hz: int) -> None:
+        """
+        Args:
+            target_rate_hz: The desired output sample rate in Hz.
+        """
+        if target_rate_hz <= 0:
+            raise ValueError(f"target_rate_hz must be positive, got {target_rate_hz}")
+        self.target_rate_hz = int(target_rate_hz)
+
+    def apply(
+        self,
+        signals: np.ndarray,
+        sample_rate: int,
+        channel_names: list[str] | None = None,
+    ) -> np.ndarray:
+        """Resample every channel from sample_rate to target_rate_hz."""
+        if sample_rate == self.target_rate_hz:
+            # Already at the desired rate — no-op
+            return signals
+
+        # Compute polyphase up/down factors by simplifying the ratio via GCD.
+        # e.g. 256→128 → GCD=128 → up=2, down=1; 256→512 → up=2, down=1
+        common = gcd(self.target_rate_hz, sample_rate)
+        up   = self.target_rate_hz // common
+        down = sample_rate // common
+
+        resampled = np.zeros(
+            (signals.shape[0], int(signals.shape[1] * self.target_rate_hz / sample_rate)),
+            dtype=np.float32,
+        )
+        for i, channel in enumerate(signals):
+            resampled[i] = resample_poly(channel, up, down)
+
+        logger.info(
+            "ResampleStep: %d Hz → %d Hz (%d → %d samples)",
+            sample_rate, self.target_rate_hz, signals.shape[1], resampled.shape[1],
+        )
+        return resampled
+
+    def to_dict(self) -> dict:
+        return {"step": "resample", "target_rate_hz": self.target_rate_hz}
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "ResampleStep":
+        return cls(target_rate_hz=int(config["target_rate_hz"]))
+
+
+# ---------------------------------------------------------------------------
 # CustomStep — user-defined preprocessing step via Python code
 # ---------------------------------------------------------------------------
 
@@ -941,6 +1195,8 @@ class CustomStep(PreprocessingStep):
 STEP_REGISTRY: dict[str, type[PreprocessingStep]] = {
     "truncate":  TruncateSignal,
     "bandpass":  BandpassFilter,
+    "highpass":  HighpassFilter,
+    "lowpass":   LowpassFilter,
     "notch":     NotchFilter,
     "normalize": Normalize,
     "window":    SlidingWindow,
@@ -948,7 +1204,8 @@ STEP_REGISTRY: dict[str, type[PreprocessingStep]] = {
     "reject":    EpochRejection,
     "channels":  ChannelSelector,
     "ica":       ICAFilter,
-    "custom":    CustomStep,   # user-defined step via pasted Python code
+    "resample":  ResampleStep,  # change sample rate via polyphase filtering
+    "custom":    CustomStep,    # user-defined step via pasted Python code
 }
 
 
@@ -1029,6 +1286,11 @@ class Pipeline:
             if isinstance(step, ChannelSelector):
                 channel_names = step.channels
 
+            # If ResampleStep ran, update the tracked sample_rate so all
+            # subsequent steps (and windowing) operate at the new rate.
+            if isinstance(step, ResampleStep):
+                sample_rate = step.target_rate_hz
+
         # Phase 2: Apply windowing (changes return type to list[np.ndarray])
         if window_step is not None:
             logger.info("Applying step: %s", window_step.to_dict())
@@ -1043,7 +1305,9 @@ class Pipeline:
             logger.info("Applying epoch rejection: %s", step.to_dict())
             windows = step.apply_to_windows(windows, sample_rate)
 
-        return windows
+        # Return windows and the final sample_rate (may differ from session.sample_rate
+        # if a ResampleStep was applied).
+        return windows, sample_rate
 
     def to_dict(self) -> dict:
         """

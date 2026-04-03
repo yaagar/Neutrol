@@ -100,7 +100,33 @@ export default function TrainPage() {
   const [importResult, setImportResult]     = useState(null)  // {job_id, model_name, class_names}
   const [importError, setImportError]       = useState(null)
 
+  // Training elapsed time — reset when a new job starts, tick every second while running
+  const [elapsedSec, setElapsedSec]         = useState(0)
+  const elapsedRef = useRef(0)  // mirror for the interval callback (avoids stale closure)
+
+  // Classical ML panel
+  const [showClassical, setShowClassical]     = useState(false)
+  const [classicalAlgo, setClassicalAlgo]     = useState('LDA')
+  const [classicalHyperparams, setClassicalHyperparams] = useState({})
+  const [classicalJobId, setClassicalJobId]   = useState(null)
+  const [classicalResult, setClassicalResult] = useState(null)
+  const [classicalError, setClassicalError]   = useState(null)
+  const [classicalRunning, setClassicalRunning] = useState(false)
+  const [algorithms, setAlgorithms]           = useState([])  // from GET /api/train/classical/algorithms
+
   const wsRef = useRef(null)
+
+  // Tick elapsed time every second while training is running
+  useEffect(() => {
+    if (status !== 'running') return
+    elapsedRef.current = 0
+    setElapsedSec(0)
+    const interval = setInterval(() => {
+      elapsedRef.current += 1
+      setElapsedSec(elapsedRef.current)
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [status])
 
   // -------------------------------------------------------------------------
   // On session change: reset run selection and reload data
@@ -270,6 +296,69 @@ export default function TrainPage() {
       setImportError(`Network error: ${err.message}`)
     } finally {
       setImporting(false)
+    }
+  }
+
+  // Load algorithm list from backend on mount
+  useEffect(() => {
+    fetch(`${API}/api/train/classical/algorithms`)
+      .then(r => r.json())
+      .then(j => { if (j.success) setAlgorithms(j.data) })
+      .catch(() => {})
+  }, [])
+
+  // Start a classical ML training job
+  async function startClassicalTraining() {
+    if (!currentSession || !labelSummary || labelSummary.total === 0) return
+    setClassicalRunning(true)
+    setClassicalError(null)
+    setClassicalResult(null)
+    setClassicalJobId(null)
+    try {
+      const res  = await fetch(`${API}/api/train/classical/start`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          session_id:  currentSession.session_id,
+          run_id:      selectedRunId || null,
+          algorithm:   classicalAlgo,
+          hyperparams: classicalHyperparams,
+          model_name:  `${classicalAlgo}_${Date.now()}`,
+        }),
+      })
+      const json = await res.json()
+      if (!json.success) {
+        setClassicalError(json.error || 'Failed to start classical training.')
+        return
+      }
+      const jid = json.data.job_id
+      setClassicalJobId(jid)
+
+      // Poll status until done (classical ML finishes in seconds)
+      const poll = async () => {
+        const sr  = await fetch(`${API}/api/train/${jid}/status`)
+        const sj  = await sr.json()
+        if (!sj.success) { setClassicalError(sj.error); setClassicalRunning(false); return }
+        const job = sj.data
+        if (job.status === 'done') {
+          // Fetch final results
+          const rr  = await fetch(`${API}/api/train/${jid}/results`)
+          const rj  = await rr.json()
+          setClassicalResult(rj.success ? { ...rj.data, algorithm: job.algorithm, cv_scores: job.cv_scores } : null)
+          setClassicalRunning(false)
+          fetchAllJobs()
+        } else if (job.status === 'failed') {
+          const errMsg = job.updates?.slice().reverse().find(u => u.type === 'error')?.message || 'Training failed.'
+          setClassicalError(errMsg)
+          setClassicalRunning(false)
+        } else {
+          setTimeout(poll, 500)  // poll every 500ms
+        }
+      }
+      poll()
+    } catch (err) {
+      setClassicalError(`Network error: ${err.message}`)
+      setClassicalRunning(false)
     }
   }
 
@@ -451,6 +540,44 @@ export default function TrainPage() {
   const totalEpochs  = config.epochs
   const currentEpoch = history.length
 
+  // Format elapsed seconds as m:ss (e.g. 1:05)
+  function formatElapsed(sec) {
+    const m = Math.floor(sec / 60)
+    const s = sec % 60
+    return `${m}:${String(s).padStart(2, '0')}`
+  }
+
+  // Architecture JSON save/load helpers
+  function downloadArchitecture() {
+    const blob = new Blob([JSON.stringify({ version: 1, layers }, null, 2)], { type: 'application/json' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = `${modelName || 'model'}_layers.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  function importArchitecture(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.target.result)
+        if (Array.isArray(parsed.layers)) {
+          setTrainPageState({ layers: parsed.layers })
+        }
+      } catch { /* ignore invalid JSON */ }
+    }
+    reader.readAsText(file)
+    // Reset file input so same file can be re-imported
+    e.target.value = ''
+  }
+
+  // Check if selected classical algorithm is unsupervised (K-Means / GMM)
+  const isUnsupervisedAlgo = classicalAlgo === 'KMeans' || classicalAlgo === 'GMM'
+
   const startDisabled = starting
     || !labelSummary
     || labelSummary.total === 0
@@ -563,6 +690,26 @@ export default function TrainPage() {
             </button>
           </div>
         )}
+
+        {/* Class imbalance warning — shown when largest class is >2.5× the smallest */}
+        {labelSummary && (() => {
+          const knownCounts = Object.entries(labelSummary.counts).filter(([l]) => l !== 'unknown')
+          if (knownCounts.length < 2) return null
+          const counts = knownCounts.map(([, n]) => n)
+          const maxCount = Math.max(...counts)
+          const minCount = Math.min(...counts)
+          if (minCount === 0 || maxCount / minCount <= 2.5) return null
+          const majorClass = knownCounts.find(([, n]) => n === maxCount)[0]
+          const minorClass = knownCounts.find(([, n]) => n === minCount)[0]
+          return (
+            <div className="mt-3 bg-yellow-900/20 border border-yellow-700/60 rounded-lg px-4 py-3 text-sm text-yellow-300">
+              <span className="font-semibold">{majorClass}</span> has{' '}
+              {(maxCount / minCount).toFixed(1)}× more windows than{' '}
+              <span className="font-semibold">{minorClass}</span>.{' '}
+              Model may be biased toward {majorClass}. Collect more {minorClass} data or enable augmentation.
+            </div>
+          )
+        })()}
       </section>
 
       {/* ------------------------------------------------------------------ */}
@@ -672,10 +819,30 @@ export default function TrainPage() {
 
               {/* Layer architecture editor */}
               <div className="mb-5">
-                <p className="text-xs text-gray-500 mb-3">
-                  Layer Architecture
-                  <span className="ml-2 text-gray-600">— click × to delete, use ▲▼ to reorder</span>
-                </p>
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs text-gray-500">
+                    Layer Architecture
+                    <span className="ml-2 text-gray-600">— click × to delete, use ▲▼ to reorder</span>
+                  </p>
+                  {/* Export / Import architecture as JSON so users can share or restore layer configs */}
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={downloadArchitecture}
+                      disabled={layers.length === 0}
+                      title="Export architecture as JSON"
+                      className="text-xs text-gray-500 hover:text-gray-300 border border-gray-700 hover:border-gray-500 rounded px-2 py-0.5 transition disabled:opacity-30"
+                    >
+                      Export JSON
+                    </button>
+                    <label
+                      title="Import architecture from JSON"
+                      className="text-xs text-gray-500 hover:text-gray-300 border border-gray-700 hover:border-gray-500 rounded px-2 py-0.5 transition cursor-pointer"
+                    >
+                      Import JSON
+                      <input type="file" accept=".json" onChange={importArchitecture} className="hidden" />
+                    </label>
+                  </div>
+                </div>
                 <ModelLayerEditor
                   layers={layers}
                   onChange={(newLayers) => setTrainPageState({ layers: newLayers })}
@@ -713,6 +880,56 @@ export default function TrainPage() {
                     value={config.batch_size}
                     onChange={e => setTrainPageState({ config: { ...config, batch_size: parseInt(e.target.value) } })}
                     disabled={status === 'running'}
+                    className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  />
+                </label>
+              </div>
+
+              {/* Advanced training options: optimizer, early stopping, gradient clipping */}
+              <div className="mt-4 pt-3 border-t border-gray-800 grid grid-cols-2 gap-4">
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-400">Optimizer</span>
+                  <select
+                    value={config.optimizer || 'adam'}
+                    onChange={e => setTrainPageState({ config: { ...config, optimizer: e.target.value } })}
+                    disabled={status === 'running'}
+                    className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  >
+                    <option value="adam">Adam (recommended)</option>
+                    <option value="adamw">AdamW (weight decay)</option>
+                    <option value="rmsprop">RMSprop (good for RNNs)</option>
+                    <option value="sgd">SGD (manual LR tuning)</option>
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-400">Weight Decay</span>
+                  <input
+                    type="number" step="0.0001" min="0" max="0.1"
+                    value={config.weight_decay ?? 0}
+                    onChange={e => setTrainPageState({ config: { ...config, weight_decay: parseFloat(e.target.value) } })}
+                    disabled={status === 'running'}
+                    className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-400">Early Stopping Patience</span>
+                  <input
+                    type="number" step="1" min="0" max="50"
+                    value={config.early_stopping_patience ?? 0}
+                    onChange={e => setTrainPageState({ config: { ...config, early_stopping_patience: parseInt(e.target.value) } })}
+                    disabled={status === 'running'}
+                    placeholder="0 = off"
+                    className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-gray-400">Gradient Clip Norm</span>
+                  <input
+                    type="number" step="0.1" min="0" max="10"
+                    value={config.gradient_clip_norm ?? 0}
+                    onChange={e => setTrainPageState({ config: { ...config, gradient_clip_norm: parseFloat(e.target.value) } })}
+                    disabled={status === 'running'}
+                    placeholder="0 = off"
                     className="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-purple-500 disabled:opacity-50"
                   />
                 </label>
@@ -927,6 +1144,8 @@ export default function TrainPage() {
                   <span className="text-xs text-gray-400">
                     Epoch {currentEpoch} / {totalEpochs}
                   </span>
+                  {/* Live elapsed time counter so users know how long training is taking */}
+                  <span className="text-xs text-gray-500">{formatElapsed(elapsedSec)} elapsed</span>
                 </>
               )}
               {status === 'done'   && <span className="text-xs text-green-400 font-medium">Complete</span>}
@@ -1042,6 +1261,56 @@ export default function TrainPage() {
                 matrix={finalResult.confusion_matrix}
                 classNames={finalResult.class_names}
               />
+            </div>
+          )}
+
+          {/* ROC curves — one line per class (one-vs-rest), with AUC in legend */}
+          {finalResult.roc_data && finalResult.roc_data.length > 0 && (
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 mt-4">
+              <p className="text-xs text-gray-500 mb-1">ROC Curves (one-vs-rest)</p>
+              <p className="text-xs text-gray-600 mb-4">Higher area = better discrimination per class. Diagonal = no-skill baseline.</p>
+              <ResponsiveContainer width="100%" height={260}>
+                <LineChart margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                  <XAxis
+                    type="number" dataKey="fpr" domain={[0, 1]}
+                    label={{ value: 'False Positive Rate', position: 'insideBottom', offset: -2, fill: '#6b7280', fontSize: 11 }}
+                    stroke="#6b7280" tick={{ fontSize: 10 }}
+                  />
+                  <YAxis
+                    type="number" dataKey="tpr" domain={[0, 1]}
+                    label={{ value: 'True Positive Rate', angle: -90, position: 'insideLeft', offset: 10, fill: '#6b7280', fontSize: 11 }}
+                    stroke="#6b7280" tick={{ fontSize: 10 }}
+                  />
+                  <Tooltip
+                    contentStyle={{ background: '#1f2937', border: '1px solid #374151', fontSize: 11 }}
+                    formatter={(v) => v.toFixed(3)}
+                  />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  {/* Diagonal no-skill reference line (fpr==tpr) */}
+                  <Line
+                    data={[{ fpr: 0, tpr: 0 }, { fpr: 1, tpr: 1 }]}
+                    type="linear" dataKey="tpr" name="No skill"
+                    stroke="#4b5563" strokeDasharray="4 4" dot={false} strokeWidth={1}
+                    legendType="none"
+                  />
+                  {/* One curve per class with AUC shown in legend label */}
+                  {finalResult.roc_data.map((curve, i) => {
+                    const className = finalResult.class_names?.[curve.class_idx] ?? `Class ${curve.class_idx}`
+                    const colors    = ['#60a5fa','#4ade80','#f87171','#fb923c','#a78bfa','#34d399','#f472b6']
+                    return (
+                      <Line
+                        key={curve.class_idx}
+                        data={curve.points}
+                        type="monotone" dataKey="tpr"
+                        name={`${className} (AUC ${curve.auc.toFixed(3)})`}
+                        stroke={colors[i % colors.length]}
+                        dot={false} strokeWidth={2}
+                      />
+                    )
+                  })}
+                </LineChart>
+              </ResponsiveContainer>
             </div>
           )}
 
@@ -1371,6 +1640,148 @@ export default function TrainPage() {
             )}
             {importError && (
               <p className="text-red-400 text-xs bg-red-900/20 rounded p-2">{importError}</p>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Section 11: Classical ML — LDA / SVM / Random Forest / GBM          */}
+      {/* ------------------------------------------------------------------ */}
+      <section className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+        <button
+          onClick={() => setShowClassical(v => !v)}
+          className="w-full flex items-center justify-between px-5 py-3 text-sm font-semibold text-gray-300 hover:bg-gray-800 transition"
+        >
+          <span>{showClassical ? '▾' : '▸'} Classical ML (LDA / SVM / RF / GBM)</span>
+          <span className="text-xs font-normal text-gray-500">Fast models, no GPU needed</span>
+        </button>
+        {showClassical && (
+          <div className="px-5 pb-5 pt-2 border-t border-gray-800 space-y-4">
+            <p className="text-xs text-gray-500">
+              Classical ML works well with as few as 20–30 labeled windows per class — great for
+              quick prototyping or when deep learning is overkill. LDA is the standard for P300
+              and SSVEP systems. Uses 5-fold cross-validation for accurate evaluation.
+            </p>
+
+            {/* Unsupervised hint — shown when KMeans or GMM is selected */}
+            {isUnsupervisedAlgo && (
+              <div className="bg-blue-900/20 border border-blue-700/60 rounded-lg px-4 py-2 text-xs text-blue-300">
+                <span className="font-semibold">Unsupervised — no labels needed.</span>{' '}
+                {classicalAlgo === 'KMeans'
+                  ? 'K-Means groups windows into clusters automatically. Reports inertia (lower is tighter clusters).'
+                  : 'GMM fits a mixture of Gaussians to the data. Reports log-likelihood (higher is a better fit).'}
+                {' '}A pipeline run must still be selected so the model has windowed data to fit on.
+              </div>
+            )}
+
+            {/* Algorithm selector */}
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <p className="text-xs text-gray-400 mb-1">Algorithm</p>
+                <select
+                  value={classicalAlgo}
+                  onChange={e => { setClassicalAlgo(e.target.value); setClassicalHyperparams({}) }}
+                  className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                >
+                  {algorithms.length > 0
+                    ? algorithms.map(a => <option key={a.id} value={a.id}>{a.name}</option>)
+                    : ['LDA','SVM','RandomForest','GBM'].map(a => <option key={a} value={a}>{a}</option>)
+                  }
+                </select>
+                {algorithms.find(a => a.id === classicalAlgo) && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    {algorithms.find(a => a.id === classicalAlgo).description}
+                  </p>
+                )}
+              </div>
+
+              {/* Hyperparameters for the selected algorithm */}
+              <div className="space-y-2">
+                <p className="text-xs text-gray-400">Hyperparameters</p>
+                {(algorithms.find(a => a.id === classicalAlgo)?.hyperparams || []).map(hp => (
+                  <label key={hp.name} className="flex flex-col gap-0.5">
+                    <span className="text-xs text-gray-500">{hp.name}</span>
+                    {hp.type === 'select' ? (
+                      <select
+                        value={classicalHyperparams[hp.name] ?? hp.default}
+                        onChange={e => setClassicalHyperparams(p => ({ ...p, [hp.name]: e.target.value }))}
+                        className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+                      >
+                        {hp.options.map(o => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                    ) : (
+                      <input
+                        type="number"
+                        value={classicalHyperparams[hp.name] ?? hp.default}
+                        onChange={e => setClassicalHyperparams(p => ({ ...p, [hp.name]: parseFloat(e.target.value) || e.target.value }))}
+                        className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+                      />
+                    )}
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* Train button — unsupervised algos only need a run_id (no labels required) */}
+            <button
+              onClick={startClassicalTraining}
+              disabled={classicalRunning || (!isUnsupervisedAlgo && (!labelSummary || labelSummary.total === 0)) || !selectedRunId}
+              className="w-full py-2 rounded-lg text-sm font-medium transition bg-blue-700 hover:bg-blue-600 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {classicalRunning ? 'Training…' : `Train ${classicalAlgo}`}
+            </button>
+            {!selectedRunId && (
+              <p className="text-yellow-400 text-xs">Select a pipeline run above first.</p>
+            )}
+
+            {classicalError && (
+              <p className="text-red-400 text-xs bg-red-900/20 rounded p-2">{classicalError}</p>
+            )}
+
+            {/* Results — supervised shows accuracy + confusion matrix, unsupervised shows fit metric */}
+            {classicalResult && (
+              <div className="bg-gray-800 rounded-lg p-4 space-y-3">
+                {classicalResult.fit_metric != null ? (
+                  /* Unsupervised result: inertia (KMeans) or log-likelihood (GMM) */
+                  <div className="flex items-center gap-3">
+                    <span className="text-2xl font-bold text-blue-400">
+                      {classicalResult.fit_metric.toFixed(2)}
+                    </span>
+                    <div>
+                      <p className="text-xs text-gray-400">
+                        {classicalResult.fit_metric_name === 'inertia'
+                          ? 'Inertia (lower = tighter clusters)'
+                          : 'Log-likelihood (higher = better fit)'}
+                      </p>
+                      <p className="text-xs text-gray-500">Unsupervised — no ground truth accuracy</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3">
+                    <span className="text-2xl font-bold text-blue-400">
+                      {(classicalResult.final_val_acc * 100).toFixed(1)}%
+                    </span>
+                    <div>
+                      <p className="text-xs text-gray-400">Cross-validation accuracy ({classicalResult.algorithm})</p>
+                      {classicalResult.cv_scores?.length > 0 && (
+                        <p className="text-xs text-gray-500">
+                          Per-fold: {classicalResult.cv_scores.map(s => `${(s*100).toFixed(1)}%`).join(', ')}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {classicalResult.confusion_matrix && classicalResult.class_names && (
+                  <ConfusionMatrix
+                    matrix={classicalResult.confusion_matrix}
+                    classNames={classicalResult.class_names}
+                  />
+                )}
+                <p className="text-xs text-gray-500">
+                  Model saved as job {classicalJobId?.slice(0, 8)}… — available in Export page.
+                </p>
+              </div>
             )}
           </div>
         )}

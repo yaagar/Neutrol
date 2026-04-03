@@ -84,7 +84,16 @@ export default function InferencePage() {
   const [total, setTotal]                 = useState(0)
   const [current, setCurrent]             = useState(null)
   const [history, setHistory]             = useState([])
+  const [fullHistory, setFullHistory]     = useState([])  // unbounded — for prediction log + CSV
   const [errorMsg, setErrorMsg]           = useState(null)
+
+  // Prediction log UI state
+  const [logOpen, setLogOpen]     = useState(false)
+
+  // Hardware metadata strip state
+  const [hwBoardInfo, setHwBoardInfo] = useState(null)  // {data_rate_hz, board_id, n_channels, sample_rate}
+  const [hwStartTime, setHwStartTime] = useState(null)  // Date when hardware inference started
+  const [hwElapsed, setHwElapsed]     = useState(0)     // seconds elapsed
 
   const wsRef = useRef(null)
 
@@ -252,8 +261,12 @@ export default function InferencePage() {
   function startStream() {
     setCurrent(null)
     setHistory([])
+    setFullHistory([])
     setClassNames([])
     setTotal(0)
+    setHwBoardInfo(null)
+    setHwStartTime(source === 'hardware' ? new Date() : null)
+    setHwElapsed(0)
     setErrorMsg(null)
     setStreamStatus('connecting')
     setStreaming(true)
@@ -310,6 +323,12 @@ export default function InferencePage() {
         const next = [...prev, pred]
         return next.length > RIBBON_LENGTH ? next.slice(next.length - RIBBON_LENGTH) : next
       })
+      setFullHistory(prev => [...prev, pred])
+      // Update hardware metadata if available
+      if (msg.board_info) {
+        setHwBoardInfo(msg.board_info)
+        setHwElapsed(prev => prev + 1)
+      }
     } else if (msg.type === 'done') {
       setStreamStatus('done')
       setStreaming(false)
@@ -321,6 +340,42 @@ export default function InferencePage() {
   }
 
   useEffect(() => { return () => wsRef.current?.close() }, [])
+
+  // Hardware session duration timer
+  useEffect(() => {
+    if (source !== 'hardware' || !streaming || !hwStartTime) return
+    const id = setInterval(() => {
+      setHwElapsed(Math.round((new Date() - hwStartTime) / 1000))
+    }, 1000)
+    return () => clearInterval(id)
+  }, [source, streaming, hwStartTime])
+
+  // CSV export — builds a CSV string from fullHistory and downloads it
+  function exportCsv() {
+    if (fullHistory.length === 0) return
+    const scoreKeys = classNames
+    const header = ['#', 'Predicted', 'Confidence(%)', ...scoreKeys.map(c => `Score_${c}(%)`)]
+    const rows = fullHistory.map((p, i) => [
+      i + 1,
+      p.predicted_class,
+      (p.confidence * 100).toFixed(1),
+      ...scoreKeys.map(k => p.scores?.[k] != null ? (p.scores[k] * 100).toFixed(1) : ''),
+    ])
+    const csv = [header, ...rows].map(r => r.join(',')).join('\n')
+    const blob = new Blob([csv], { type: 'text/csv' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = `predictions_${Date.now()}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  function formatElapsed(sec) {
+    const m = Math.floor(sec / 60)
+    const s = sec % 60
+    return `${m}:${String(s).padStart(2, '0')}`
+  }
 
   // -------------------------------------------------------------------------
   // Derived display values
@@ -489,6 +544,36 @@ export default function InferencePage() {
             </div>
           )}
 
+          {/* Hardware livestream metadata strip — shown when hardware is streaming */}
+          {source === 'hardware' && streaming && (
+            <div className="bg-gray-900 border border-gray-700 rounded-xl p-3">
+              <div className="flex flex-wrap gap-3">
+                {hwBoardInfo ? (
+                  <>
+                    <span className="flex items-center gap-1.5 text-xs">
+                      <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                      <span className="text-gray-400">{hwBoardInfo.data_rate_hz} Hz effective</span>
+                    </span>
+                    <span className="text-xs text-gray-500">
+                      Board: <span className="text-gray-300">{hwBoardInfo.board_id}</span>
+                    </span>
+                    <span className="text-xs text-gray-500">
+                      Channels: <span className="text-gray-300">{hwBoardInfo.n_channels}</span>
+                    </span>
+                    <span className="text-xs text-gray-500">
+                      Sample rate: <span className="text-gray-300">{hwBoardInfo.sample_rate} Hz</span>
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-xs text-gray-600">Waiting for hardware data…</span>
+                )}
+                <span className="text-xs text-gray-500 ml-auto">
+                  Duration: <span className="text-gray-300 font-mono">{formatElapsed(hwElapsed)}</span>
+                </span>
+              </div>
+            </div>
+          )}
+
           {/* Start / Stop */}
           <button
             onClick={streaming ? stopStream : startStream}
@@ -603,6 +688,68 @@ export default function InferencePage() {
                   })}
                 </div>
               </>
+            )}
+          </div>
+
+          {/* ---------------------------------------------------------------- */}
+          {/* Prediction Log + CSV Export                                       */}
+          {/* ---------------------------------------------------------------- */}
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setLogOpen(v => !v)}
+                  className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
+                >
+                  {logOpen ? '▾' : '▸'} Prediction Log
+                  {fullHistory.length > 0 && (
+                    <span className="ml-2 text-gray-600">({fullHistory.length})</span>
+                  )}
+                </button>
+              </div>
+              {fullHistory.length > 0 && (
+                <button
+                  onClick={exportCsv}
+                  className="text-xs px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded border border-gray-700 transition-colors"
+                >
+                  Export CSV
+                </button>
+              )}
+            </div>
+            {logOpen && fullHistory.length > 0 && (
+              <div className="overflow-x-auto max-h-48 overflow-y-auto">
+                <table className="w-full text-xs text-gray-400">
+                  <thead className="sticky top-0 bg-gray-900">
+                    <tr className="border-b border-gray-800">
+                      <th className="text-left py-1 pr-3">#</th>
+                      <th className="text-left py-1 pr-3">Predicted</th>
+                      <th className="text-left py-1 pr-3">Confidence</th>
+                      {classNames.map(c => (
+                        <th key={c} className="text-left py-1 pr-3">{c} score</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...fullHistory].reverse().slice(0, 200).map((p, i) => (
+                      <tr key={i} className="border-b border-gray-800/50 hover:bg-gray-800/30">
+                        <td className="py-0.5 pr-3 text-gray-600">{fullHistory.length - i}</td>
+                        <td className="py-0.5 pr-3 font-medium" style={{ color: colorMap[p.predicted_class]?.hex || '#9ca3af' }}>
+                          {p.predicted_class}
+                        </td>
+                        <td className="py-0.5 pr-3">{(p.confidence * 100).toFixed(1)}%</td>
+                        {classNames.map(c => (
+                          <td key={c} className="py-0.5 pr-3 text-gray-500">
+                            {p.scores?.[c] != null ? `${(p.scores[c] * 100).toFixed(1)}%` : '—'}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {logOpen && fullHistory.length === 0 && (
+              <p className="text-xs text-gray-600">No predictions yet. Start streaming to see results here.</p>
             )}
           </div>
 

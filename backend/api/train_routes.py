@@ -36,6 +36,7 @@ import os
 import torch
 
 from core.trainer import run_training
+from core.classical_ml import run_classical_training, SUPPORTED_ALGORITHMS
 
 EXPORTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "exports")
 from sessions.session_store import SessionStore
@@ -112,16 +113,20 @@ async def list_jobs() -> JSONResponse:
     for job_id, job in store.training_jobs.items():
         history = job.get("history", [])
         final   = history[-1] if history else {}
+        # Classical ML jobs store final_val_acc directly; DL jobs have it in history
+        final_acc = job.get("final_val_acc") or final.get("val_acc")
         jobs.append({
             "job_id":         job_id,
             "session_id":     job.get("session_id"),
             "model_name":     job.get("model_name", ""),
             "status":         job.get("status"),
             "started_at":     job.get("started_at"),
-            "final_val_acc":  final.get("val_acc"),
+            "final_val_acc":  final_acc,
             "epochs_run":     len(history),
             "classes":        job.get("class_names", []),
             "model_path":     job.get("model_path"),
+            "ml_type":        job.get("ml_type"),       # "classical" | None
+            "algorithm":      job.get("algorithm"),     # classical ML only
         })
     # Most recent first
     jobs.sort(key=lambda j: j["started_at"] or "", reverse=True)
@@ -322,18 +327,25 @@ async def get_training_status(job_id: str) -> JSONResponse:
             content=api_response(False, error=f"Training job '{job_id}' not found."),
         )
 
-    total_epochs = job["model_config"].get("epochs", 50)
-    latest = job["history"][-1] if job["history"] else {}
+    # Classical ML jobs don't have model_config or epoch history
+    model_config  = job.get("model_config") or {}
+    total_epochs  = model_config.get("epochs", 0) if model_config else 0
+    latest        = job.get("history", [])
+    latest_metric = latest[-1] if latest else {}
 
     return JSONResponse(
         status_code=200,
         content=api_response(True, data={
             "job_id":        job_id,
             "status":        job["status"],
-            "current_epoch": job["current_epoch"],
+            "current_epoch": job.get("current_epoch", 0),
             "total_epochs":  total_epochs,
-            "latest_metrics": latest,
-            "started_at":    job["started_at"],
+            "latest_metrics": latest_metric,
+            "started_at":    job.get("started_at"),
+            "algorithm":     job.get("algorithm"),       # classical ML only
+            "ml_type":       job.get("ml_type"),         # "classical" | None
+            "cv_scores":     job.get("cv_scores", []),   # classical ML only
+            "updates":       job.get("updates", []),     # for classical ML done check
         }),
     )
 
@@ -372,10 +384,20 @@ async def get_training_results(job_id: str) -> JSONResponse:
         content=api_response(True, data={
             "job_id":           job_id,
             "status":           job["status"],
-            "history":          job["history"],
+            "history":          job.get("history", []),
             "final_metrics":    done_update,
             "model_path":       job.get("model_path"),
-            "model_config":     job["model_config"],
+            "model_config":     job.get("model_config"),  # None for classical ML
+            "ml_type":          job.get("ml_type"),       # "classical" | None
+            "algorithm":        job.get("algorithm"),     # classical ML only
+            "cv_scores":        job.get("cv_scores", []), # classical ML only
+            "final_val_acc":    done_update.get("final_val_acc") if done_update else None,
+            "confusion_matrix": done_update.get("confusion_matrix") if done_update else None,
+            "roc_data":         done_update.get("roc_data") if done_update else None,
+            "class_names":      done_update.get("class_names") if done_update else job.get("class_names", []),
+            # Unsupervised ML: inertia (KMeans) or log-likelihood (GMM); None for supervised
+            "fit_metric":       done_update.get("fit_metric") if done_update else None,
+            "fit_metric_name":  done_update.get("fit_metric_name") if done_update else None,
         }),
     )
 
@@ -731,6 +753,161 @@ async def get_model_history(model_name: str) -> JSONResponse:
         status_code=200,
         content=api_response(True, data={"model_name": model_name, "runs": runs}),
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/train/classical/algorithms
+# POST /api/train/classical/start
+# ---------------------------------------------------------------------------
+
+class ClassicalMLRequest(BaseModel):
+    """Body for POST /api/train/classical/start."""
+    session_id:  str
+    run_id:      str | None = None
+    algorithm:   str               # 'LDA', 'SVM', 'RandomForest', 'GBM'
+    hyperparams: dict = {}         # algorithm-specific hyperparameter overrides
+    model_name:  str  = ""
+
+
+@router.get("/classical/algorithms")
+async def list_classical_algorithms() -> JSONResponse:
+    """
+    Return the list of supported classical ML algorithms with descriptions.
+
+    Used by the frontend to populate the algorithm dropdown.
+    """
+    algorithms = [
+        {
+            "id":          alg_id,
+            "name":        name,
+            "description": _CLASSICAL_DESCRIPTIONS.get(alg_id, ""),
+            "hyperparams": _CLASSICAL_HYPERPARAMS.get(alg_id, []),
+        }
+        for alg_id, name in SUPPORTED_ALGORITHMS.items()
+    ]
+    return JSONResponse(status_code=200, content=api_response(True, data=algorithms))
+
+
+@router.post("/classical/start")
+async def start_classical_training(request: ClassicalMLRequest) -> JSONResponse:
+    """
+    Start a classical ML training job in a background thread.
+
+    Returns a job_id immediately. The caller can then poll
+    GET /api/train/{job_id}/status to check progress and get results.
+    Classical ML is fast (seconds), so the job will typically be done
+    before the frontend even polls once.
+    """
+    if request.algorithm not in SUPPORTED_ALGORITHMS:
+        return JSONResponse(
+            status_code=400,
+            content=api_response(
+                False,
+                error=f"Unknown algorithm '{request.algorithm}'. "
+                      f"Supported: {list(SUPPORTED_ALGORITHMS.keys())}",
+            ),
+        )
+
+    job_id = str(uuid.uuid4())
+    now    = datetime.now(timezone.utc).isoformat()
+
+    store.training_jobs[job_id] = {
+        "job_id":      job_id,
+        "status":      "running",
+        "started_at":  now,
+        "session_id":  request.session_id,
+        "run_id":      request.run_id,
+        "model_name":  request.model_name,
+        "algorithm":   request.algorithm,
+        "ml_type":     "classical",
+        "updates":     [],
+        "class_names": [],
+        "n_classes":   0,
+        "history":     [],          # empty — classical ML has no epoch history
+        "current_epoch": 0,
+    }
+
+    thread = threading.Thread(
+        target=run_classical_training,
+        args=(
+            job_id,
+            request.session_id,
+            request.run_id,
+            request.algorithm,
+            request.hyperparams,
+            request.model_name,
+        ),
+        daemon=True,
+    )
+    thread.start()
+
+    logger.info(
+        "Classical ML job %s started: algorithm=%s session=%s run=%s",
+        job_id, request.algorithm, request.session_id, request.run_id,
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content=api_response(True, data={"job_id": job_id}),
+    )
+
+
+# Per-algorithm human-readable descriptions shown in the UI
+_CLASSICAL_DESCRIPTIONS: dict[str, str] = {
+    "LDA": (
+        "Fast, no hyperparameters. Best for P300, SSVEP, and simple paradigms. "
+        "Often outperforms deep learning on small datasets (<200 windows)."
+    ),
+    "SVM": (
+        "Support Vector Machine. Handles non-linear boundaries via the kernel trick. "
+        "Good general-purpose choice. Set kernel='rbf' for most EEG tasks."
+    ),
+    "RandomForest": (
+        "Ensemble of decision trees. Robust to noise and feature redundancy. "
+        "Works well across frequency bands without careful preprocessing."
+    ),
+    "GBM": (
+        "Gradient Boosting Machine. Often the highest accuracy of classical methods. "
+        "Slower to train but worth it for final deployment models."
+    ),
+}
+
+# Hyperparameter definitions for each algorithm — used by the frontend to render inputs
+_CLASSICAL_HYPERPARAMS: dict[str, list[dict]] = {
+    "LDA": [
+        {"name": "solver",     "type": "select", "default": "svd",
+         "options": ["svd", "lsqr", "eigen"],
+         "description": "svd: no matrix inversion (stable). lsqr/eigen: support shrinkage."},
+        {"name": "shrinkage",  "type": "float",  "default": 0.0,
+         "description": "Regularisation (0=none, 'auto'=Ledoit-Wolf). Only for lsqr/eigen."},
+    ],
+    "SVM": [
+        {"name": "kernel", "type": "select", "default": "rbf",
+         "options": ["rbf", "linear", "poly", "sigmoid"],
+         "description": "rbf: handles non-linear boundaries (recommended). linear: fast."},
+        {"name": "C",      "type": "float",  "default": 1.0,
+         "description": "Regularisation strength. Higher C = less regularisation."},
+        {"name": "gamma",  "type": "select", "default": "scale",
+         "options": ["scale", "auto"],
+         "description": "Kernel coefficient. 'scale'=1/(n_features·X.var())."},
+    ],
+    "RandomForest": [
+        {"name": "n_estimators",     "type": "int",   "default": 100,
+         "description": "Number of trees. More = better but slower."},
+        {"name": "max_depth",        "type": "int",   "default": 0,
+         "description": "Maximum tree depth (0 = unlimited)."},
+        {"name": "min_samples_split","type": "int",   "default": 2,
+         "description": "Minimum samples to split a node."},
+    ],
+    "GBM": [
+        {"name": "n_estimators",  "type": "int",   "default": 100,
+         "description": "Number of boosting rounds."},
+        {"name": "learning_rate", "type": "float", "default": 0.1,
+         "description": "Shrinkage per round. Lower = slower but more robust."},
+        {"name": "max_depth",     "type": "int",   "default": 3,
+         "description": "Maximum depth of each tree. 3-5 is typical."},
+    ],
+}
 
 
 # ---------------------------------------------------------------------------

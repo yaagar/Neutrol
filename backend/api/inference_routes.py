@@ -403,6 +403,10 @@ async def stream_hardware(websocket: WebSocket) -> None:
             "n_channels":  streamer.n_channels,
         })
 
+        # Track data rate: count windows received in a rolling window
+        _window_count = 0
+        _rate_start   = asyncio.get_event_loop().time()
+
         while True:
             try:
                 stop_msg = await asyncio.wait_for(websocket.receive_json(), timeout=0.001)
@@ -415,11 +419,23 @@ async def stream_hardware(websocket: WebSocket) -> None:
             window = streamer.get_window(n_samples)
             if window is not None:
                 result = predict_window(model, window, class_names)
+
+                # Compute rolling data rate (windows/sec × n_samples = effective Hz)
+                _window_count += 1
+                elapsed = asyncio.get_event_loop().time() - _rate_start
+                data_rate_hz = round((_window_count * n_samples) / elapsed, 1) if elapsed > 0 else 0.0
+
                 await websocket.send_json({
                     "type":            "prediction",
                     "predicted_class": result["predicted_class"],
                     "confidence":      result["confidence"],
                     "scores":          result["scores"],
+                    "board_info": {
+                        "data_rate_hz": data_rate_hz,
+                        "board_id":     streamer.board_name,
+                        "n_channels":   streamer.n_channels,
+                        "sample_rate":  streamer.sample_rate,
+                    },
                 })
                 # Dispatch to external outputs
                 await store.output_dispatcher.dispatch(result["predicted_class"], result["confidence"])

@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from core.export import (
     export_microcontroller,
     export_onnx,
+    generate_classical_script,
     generate_inference_script,
     generate_onnx_script,
 )
@@ -138,7 +139,9 @@ async def export_model(job_id: str) -> FileResponse | JSONResponse:
         )
 
     model_name = job.get("model_name", "")
-    filename   = f"{(model_name or job_id[:8]).replace(' ', '_')}.pt"
+    # Classical ML jobs save .pkl files; deep learning jobs save .pt files
+    ext      = ".pkl" if job.get("ml_type") == "classical" else ".pt"
+    filename = f"{(model_name or job_id[:8]).replace(' ', '_')}{ext}"
 
     logger.info("Serving model file for job %s: %s", job_id, model_path)
 
@@ -188,22 +191,36 @@ async def export_script(job_id: str) -> PlainTextResponse | JSONResponse:
             content=api_response(False, error="Model file not found — cannot generate script."),
         )
 
-    # Load the checkpoint to extract metadata for the script header
-    try:
-        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-    except Exception as exc:
-        logger.error("Failed to load checkpoint for job %s: %s", job_id, exc)
-        return JSONResponse(
-            status_code=500,
-            content=api_response(False, error=f"Could not read model file: {exc}"),
-        )
+    model_name = job.get("model_name", "")
 
-    model_name  = job.get("model_name", "")
-    script_code = generate_inference_script(job_id, checkpoint, model_name)
+    # Classical ML jobs use .pkl — generate a scikit-learn inference script
+    if job.get("ml_type") == "classical":
+        import pickle
+        try:
+            with open(model_path, "rb") as f:
+                pkl_data = pickle.load(f)
+        except Exception as exc:
+            logger.error("Failed to load pkl for job %s: %s", job_id, exc)
+            return JSONResponse(
+                status_code=500,
+                content=api_response(False, error=f"Could not read model file: {exc}"),
+            )
+        script_code = generate_classical_script(job_id, pkl_data, model_name)
+        script_stem = f"neutrol_classical_{job_id[:8]}"
+    else:
+        # Deep learning — load PyTorch checkpoint
+        try:
+            checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            logger.error("Failed to load checkpoint for job %s: %s", job_id, exc)
+            return JSONResponse(
+                status_code=500,
+                content=api_response(False, error=f"Could not read model file: {exc}"),
+            )
+        script_code = generate_inference_script(job_id, checkpoint, model_name)
+        script_stem = f"neutrol_inference_{job_id[:8]}"
 
-    script_stem = f"neutrol_inference_{job_id[:8]}"
-    filename    = f"{script_stem}.py"
-
+    filename = f"{script_stem}.py"
     logger.info("Generated inference script for job %s (%d bytes)", job_id, len(script_code))
 
     return PlainTextResponse(

@@ -796,6 +796,151 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
+# generate_classical_script — standalone inference script for .pkl models
+# ---------------------------------------------------------------------------
+
+def generate_classical_script(job_id: str, pkl_data: dict, model_name: str) -> str:
+    """
+    Generate a standalone Python inference script for a classical ML model.
+
+    The script is self-contained: load the .pkl, call predict(raw_window),
+    get back {class, confidence, probabilities}.  No Neutrol import needed.
+
+    Args:
+        job_id:    Training job UUID (used in script filename constant).
+        pkl_data:  Dict loaded from the .pkl checkpoint.
+        model_name: Human-readable name for the script header.
+
+    Returns:
+        Python source code as a string.
+    """
+    algorithm    = pkl_data.get("algorithm", "Unknown")
+    class_names  = pkl_data.get("class_names", [])
+    n_channels   = pkl_data.get("n_channels", "?")
+    n_samples    = pkl_data.get("n_samples", "?")
+    unsupervised = pkl_data.get("unsupervised", False)
+    trained_at   = pkl_data.get("trained_at", "unknown")
+    script_stem  = f"neutrol_classical_{job_id[:8]}"
+
+    classes_repr = repr(class_names)
+
+    lines: list[str] = []
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    lines += [
+        '"""',
+        f"{script_stem}.py — Neutrol classical ML inference script",
+        f"Model:     {model_name or 'Unnamed'} ({algorithm})",
+        f"Classes:   {', '.join(class_names) if class_names else 'N/A (unsupervised)'}",
+        f"Input:     ({n_channels}, {n_samples}) — (n_channels, n_samples_per_window)",
+        f"Trained:   {trained_at}",
+        '"""',
+        "",
+        "import os",
+        "import pickle",
+        "import numpy as np",
+        "",
+        f'MODEL_FILE = "{script_stem}.pkl"  # keep in the same folder as this script',
+        "",
+        "# ── Lazy model loader ─────────────────────────────────────────────────────",
+        "_clf      = None",
+        "_metadata = None",
+        "",
+        "def _get_model():",
+        "    global _clf, _metadata",
+        "    if _clf is not None:",
+        "        return _clf, _metadata",
+        "    script_dir = os.path.dirname(os.path.abspath(__file__))",
+        '    pkl_path   = os.path.join(script_dir, MODEL_FILE)',
+        "    if not os.path.exists(pkl_path):",
+        '        raise FileNotFoundError(f"Model file not found: {pkl_path}")',
+        "    with open(pkl_path, 'rb') as f:",
+        "        data = pickle.load(f)",
+        "    _clf      = data['classifier']",
+        "    _metadata = data",
+        "    return _clf, _metadata",
+        "",
+    ]
+
+    if unsupervised:
+        # Unsupervised: predict cluster assignment, no probability interpretation
+        lines += [
+            "# ── predict ───────────────────────────────────────────────────────────────",
+            "def predict(raw_window: np.ndarray) -> dict:",
+            '    """',
+            "    Predict cluster assignment for a single EEG window.",
+            "",
+            "    Args:",
+            f"        raw_window: np.ndarray of shape ({n_channels}, {n_samples})",
+            "",
+            "    Returns:",
+            "        dict with keys: cluster (int), label (str)",
+            '    """',
+            "    clf, meta = _get_model()",
+            "    flat  = raw_window.flatten().reshape(1, -1).astype(np.float32)",
+            "    label = int(clf.predict(flat)[0])",
+            "    return {'cluster': label, 'label': str(label)}",
+            "",
+        ]
+    else:
+        lines += [
+            "# ── predict ───────────────────────────────────────────────────────────────",
+            "def predict(raw_window: np.ndarray) -> dict:",
+            '    """',
+            "    Classify a single EEG window.",
+            "",
+            "    Args:",
+            f"        raw_window: np.ndarray of shape ({n_channels}, {n_samples})",
+            "",
+            "    Returns:",
+            "        dict with keys: predicted_class (str), confidence (float 0-1),",
+            "                        probabilities (dict class→float)",
+            '    """',
+            "    clf, meta   = _get_model()",
+            f"    class_names = {classes_repr}",
+            "    flat        = raw_window.flatten().reshape(1, -1).astype(np.float32)",
+            "",
+            "    if hasattr(clf, 'predict_proba'):",
+            "        proba       = clf.predict_proba(flat)[0]",
+            "        best_idx    = int(np.argmax(proba))",
+            "        best_class  = class_names[best_idx] if best_idx < len(class_names) else str(best_idx)",
+            "        confidence  = float(proba[best_idx])",
+            "        probs_dict  = {class_names[i]: float(proba[i]) for i in range(len(proba))}",
+            "    else:",
+            "        # Algorithms without predict_proba (e.g. raw SVC without probability=True)",
+            "        raw_pred   = clf.predict(flat)[0]",
+            "        best_class = class_names[int(raw_pred)] if int(raw_pred) < len(class_names) else str(raw_pred)",
+            "        confidence = 1.0",
+            "        probs_dict = {best_class: 1.0}",
+            "",
+            "    return {",
+            "        'predicted_class': best_class,",
+            "        'confidence':      confidence,",
+            "        'probabilities':   probs_dict,",
+            "    }",
+            "",
+            "",
+        ]
+
+    # ── on_prediction callback + __main__ self-test ───────────────────────────
+    lines += [
+        "def on_prediction(predicted_class: str, confidence: float, probabilities: dict) -> None:",
+        '    """Override this in your application to consume predictions."""',
+        f'    print(f"Predicted: {{predicted_class}} ({{confidence*100:.1f}}%)")',
+        "",
+        "",
+        'if __name__ == "__main__":',
+        "    print('Running self-test with a random window...')",
+        f"    dummy = np.random.randn({n_channels}, {n_samples}).astype(np.float32)",
+        "    result = predict(dummy)",
+        "    print(result)",
+        "    print('Self-test passed.')",
+    ]
+
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # export_microcontroller — ZIP with .h + .cpp + README for ESP32/STM32
 # ---------------------------------------------------------------------------
 

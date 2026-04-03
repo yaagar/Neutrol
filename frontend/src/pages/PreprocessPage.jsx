@@ -15,6 +15,8 @@ import WaveformChart from '../components/WaveformChart'
 import FrequencyChart from '../components/FrequencyChart'
 import BandPowerChart from '../components/BandPowerChart'
 import SpectrogramChart from '../components/SpectrogramChart'
+import ERPChart from '../components/ERPChart'
+import ElectrodeMap from '../components/ElectrodeMap'
 
 import { API_BASE_URL } from '../config'
 const API = API_BASE_URL
@@ -48,6 +50,24 @@ const STEP_PRESETS = [
     ],
   },
   {
+    label: 'Highpass Filter',
+    config: { step: 'highpass', cutoff_hz: 1.0, filter_type: 'butterworth', order: 4 },
+    fields: [
+      { key: 'cutoff_hz',   label: 'Cutoff (Hz)', type: 'number', min: 0.01, step: 0.1 },
+      { key: 'filter_type', label: 'Type',         type: 'select', options: ['butterworth', 'chebyshev1', 'chebyshev2', 'bessel'] },
+      { key: 'order',       label: 'Order',         type: 'number', min: 1,    step: 1 },
+    ],
+  },
+  {
+    label: 'Lowpass Filter',
+    config: { step: 'lowpass', cutoff_hz: 40.0, filter_type: 'butterworth', order: 4 },
+    fields: [
+      { key: 'cutoff_hz',   label: 'Cutoff (Hz)', type: 'number', min: 0.1, step: 1 },
+      { key: 'filter_type', label: 'Type',         type: 'select', options: ['butterworth', 'chebyshev1', 'chebyshev2', 'bessel'] },
+      { key: 'order',       label: 'Order',         type: 'number', min: 1,   step: 1 },
+    ],
+  },
+  {
     label: 'Channel Selector',
     // channels is a list — rendered as checkboxes using session.channel_names
     config: { step: 'channels', channels: [] },
@@ -55,9 +75,9 @@ const STEP_PRESETS = [
   },
   {
     label: 'Re-reference',
-    config: { step: 'reref', method: 'average' },
+    config: { step: 'reref', method: 'average', ref_channel: null },
     fields: [
-      { key: 'method', label: 'Method', type: 'select', options: ['average', 'linked_mastoid'] },
+      { key: 'method', label: 'Method', type: 'select', options: ['average', 'linked_mastoid', 'electrode'] },
     ],
   },
   {
@@ -83,6 +103,13 @@ const STEP_PRESETS = [
     ],
   },
   {
+    label: 'Resample',
+    config: { step: 'resample', target_rate_hz: 256 },
+    fields: [
+      { key: 'target_rate_hz', label: 'Target (Hz)', type: 'number', min: 1, step: 1 },
+    ],
+  },
+  {
     label: 'Custom Step',
     // code field handled specially in render (textarea, not a regular field)
     config: {
@@ -101,6 +128,7 @@ const ANALYSIS_TABS = [
   { id: 'frequency',   label: 'Frequency' },
   { id: 'bandpower',   label: 'Band Power' },
   { id: 'spectrogram', label: 'Spectrogram' },
+  { id: 'erp',         label: 'ERP' },
 ]
 
 export default function PreprocessPage() {
@@ -135,12 +163,24 @@ export default function PreprocessPage() {
   const [statsLoading, setStatsLoading] = useState(false)
   const [statsOpen, setStatsOpen]       = useState(false)  // collapsed by default
 
+  // ERP data (from POST /api/analysis/erp — requires labeled windows)
+  const [erpData, setErpData]       = useState(null)
+  const [erpLoading, setErpLoading] = useState(false)
+  const [erpError, setErpError]     = useState(null)
+
   // Dashboard view mode — 'tabs' shows one chart at a time, 'dashboard' shows 2×2 grid
   const [viewMode, setViewMode]     = useState('tabs')
   // In dashboard mode, clicking ⤢ on a chart sets expandedChart to show it full-width
   const [expandedChart, setExpandedChart] = useState(null)  // null | 'time' | 'frequency' | 'bandpower' | 'spectrogram'
   // Per-chart loading flags for dashboard mode so each tile shows its own spinner
   const [dashLoading, setDashLoading] = useState({ time: false, frequency: false, bandpower: false, spectrogram: false })
+
+  // Single-channel focus mode on the Time tab (null = all channels, index = one channel)
+  const [waveformFocusChannel, setWaveformFocusChannel] = useState(null)
+
+  // Split view mode — Before (raw) and After (preprocessed) side by side for the active tab
+  const [splitData, setSplitData]     = useState({ raw: null, processed: null })
+  const [splitLoading, setSplitLoading] = useState(false)
 
   // -------------------------------------------------------------------------
   // Load existing runs when session changes
@@ -331,6 +371,31 @@ export default function PreprocessPage() {
     }
   }
 
+  // Fetch ERP data for the ERP tab.
+  // Requires a pipeline run_id AND labeled windows (from the Label page).
+  async function fetchERP() {
+    if (!currentSession || !activeRunId) {
+      setErpError('Select a pipeline run first, then label windows on the Label page.')
+      return
+    }
+    setErpLoading(true)
+    setErpError(null)
+    try {
+      const res  = await fetch(`${API}/api/analysis/erp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: currentSession.session_id, run_id: activeRunId }),
+      })
+      const json = await res.json()
+      if (json.success) setErpData(json.data)
+      else setErpError(json.error || 'ERP computation failed.')
+    } catch (err) {
+      setErpError('Failed to compute ERP. Is the backend running?')
+    } finally {
+      setErpLoading(false)
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Dashboard mode: fetch all 4 charts in parallel with Promise.all
   //
@@ -384,6 +449,7 @@ export default function PreprocessPage() {
     if (activeTab === 'frequency' && !psdData) fetchPsd()
     if (activeTab === 'bandpower' && !bandData) fetchBandPower()
     if (activeTab === 'spectrogram' && !spectrogramData) fetchSpectrogram()
+    if (activeTab === 'erp' && !erpData) fetchERP()
   }, [activeTab, currentSession?.session_id, viewMode])
 
   // Re-fetch when before/after or channel selection changes
@@ -459,6 +525,61 @@ export default function PreprocessPage() {
     setPreprocessPageState({ pipelineSteps: updated })
   }
 
+  // Set the reference electrode for a reref step using the electrode mode
+  function setRefChannel(idx, channelName) {
+    const updated = [...pipelineSteps]
+    updated[idx]  = { ...updated[idx], ref_channel: channelName }
+    setPreprocessPageState({ pipelineSteps: updated })
+  }
+
+  // -------------------------------------------------------------------------
+  // Split view: fetch both raw and processed data for the current tab in parallel
+  // -------------------------------------------------------------------------
+  async function fetchSplitView() {
+    if (!currentSession || !activeRunId) return
+    setSplitLoading(true)
+    setSplitData({ raw: null, processed: null })
+
+    const rawBody  = { session_id: currentSession.session_id, run_id: null }
+    const procBody = { session_id: currentSession.session_id, run_id: activeRunId }
+
+    try {
+      if (activeTab === 'time') {
+        // Time tab: raw waveform only (no processed waveform endpoint)
+        setSplitData({ raw: waveformData, processed: null })
+        setSplitLoading(false)
+        return
+      }
+
+      const endpointMap = {
+        frequency:   '/api/analysis/psd',
+        bandpower:   '/api/analysis/bandpower',
+        spectrogram: '/api/analysis/spectrogram',
+      }
+      const endpoint = endpointMap[activeTab]
+      if (!endpoint) { setSplitLoading(false); return }
+
+      const specBody = { ...rawBody,  channel_index: selectedChannel }
+      const specProc = { ...procBody, channel_index: selectedChannel }
+
+      const [rawRes, procRes] = await Promise.all([
+        fetch(`${API}${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(activeTab === 'spectrogram' ? specBody : rawBody) }),
+        fetch(`${API}${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(activeTab === 'spectrogram' ? specProc : procBody) }),
+      ])
+      const [rawJson, procJson] = await Promise.all([rawRes.json(), procRes.json()])
+      setSplitData({
+        raw:       rawJson.success  ? rawJson.data  : null,
+        processed: procJson.success ? procJson.data : null,
+      })
+    } catch (err) {
+      setAnalysisError(`Split view error: ${err.message}`)
+    } finally {
+      setSplitLoading(false)
+    }
+  }
+
   function getStepPreset(stepConfig) {
     return STEP_PRESETS.find(p => p.config.step === stepConfig.step)
   }
@@ -484,6 +605,17 @@ export default function PreprocessPage() {
 
   const channelNames = currentSession.channel_names || []
   const hasRun       = runs.length > 0
+
+  // Standard 10-20 names — used to decide whether to show the ElectrodeMap SVG
+  // or fall back to the simple checkbox grid when channels are non-standard.
+  const STANDARD_10_20 = new Set([
+    'Fp1','Fp2','Fz','F3','F4','F7','F8',
+    'Cz','C3','C4','T3','T4','T7','T8',
+    'Pz','P3','P4','T5','T6','P7','P8',
+    'O1','O2','A1','A2','Oz','FCz','AFz',
+  ])
+  const matchedCount = channelNames.filter(ch => STANDARD_10_20.has(ch)).length
+  const useElectrodeMap = matchedCount >= 4
 
   // -------------------------------------------------------------------------
   // Render
@@ -618,31 +750,74 @@ export default function PreprocessPage() {
                     </div>
                   )}
 
-                  {/* Channel Selector — visual checkbox list */}
+                  {/* Channel Selector — ElectrodeMap SVG when ≥4 standard 10-20 names, else checkbox grid */}
                   {stepConfig.step === 'channels' && (
                     <div className="mt-1">
                       <p className="text-xs text-gray-400 mb-1">Channels to keep:</p>
-                      <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto">
-                        {channelNames.map(ch => {
-                          const isSelected = (stepConfig.channels || []).includes(ch)
-                          return (
+                      {useElectrodeMap ? (
+                        <ElectrodeMap
+                          channelNames={channelNames}
+                          mode="select"
+                          selectedChannels={stepConfig.channels || []}
+                          onToggle={(ch) => toggleChannel(idx, ch)}
+                        />
+                      ) : (
+                        <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto">
+                          {channelNames.map(ch => {
+                            const isSelected = (stepConfig.channels || []).includes(ch)
+                            return (
+                              <button
+                                key={ch}
+                                onClick={() => toggleChannel(idx, ch)}
+                                className={`text-xs px-1.5 py-0.5 rounded border transition ${
+                                  isSelected
+                                    ? 'bg-blue-600 border-blue-500 text-white'
+                                    : 'bg-gray-600 border-gray-500 text-gray-300 hover:bg-gray-500'
+                                }`}
+                              >
+                                {ch}
+                              </button>
+                            )
+                          })}
+                        </div>
+                      )}
+                      <p className="text-xs text-gray-500 mt-1">
+                        {(stepConfig.channels || []).length}/{channelNames.length} selected
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Re-reference electrode picker — ElectrodeMap in reref mode when method is 'electrode' */}
+                  {stepConfig.step === 'reref' && stepConfig.method === 'electrode' && (
+                    <div className="mt-2">
+                      <p className="text-xs text-gray-400 mb-1">Click electrode to set as reference:</p>
+                      {useElectrodeMap ? (
+                        <ElectrodeMap
+                          channelNames={channelNames}
+                          mode="reref"
+                          referenceChannel={stepConfig.ref_channel || null}
+                          onSetRef={(ch) => setRefChannel(idx, ch)}
+                        />
+                      ) : (
+                        <div className="flex flex-wrap gap-1 max-h-20 overflow-y-auto">
+                          {channelNames.map(ch => (
                             <button
                               key={ch}
-                              onClick={() => toggleChannel(idx, ch)}
+                              onClick={() => setRefChannel(idx, ch)}
                               className={`text-xs px-1.5 py-0.5 rounded border transition ${
-                                isSelected
-                                  ? 'bg-blue-600 border-blue-500 text-white'
+                                stepConfig.ref_channel === ch
+                                  ? 'bg-yellow-600 border-yellow-500 text-white'
                                   : 'bg-gray-600 border-gray-500 text-gray-300 hover:bg-gray-500'
                               }`}
                             >
                               {ch}
                             </button>
-                          )
-                        })}
-                      </div>
-                      <p className="text-xs text-gray-500 mt-1">
-                        {(stepConfig.channels || []).length}/{channelNames.length} selected
-                      </p>
+                          ))}
+                        </div>
+                      )}
+                      {stepConfig.ref_channel && (
+                        <p className="text-xs text-yellow-400 mt-1">Reference: {stepConfig.ref_channel}</p>
+                      )}
                     </div>
                   )}
                 </div>
@@ -696,6 +871,13 @@ export default function PreprocessPage() {
         {runError && (
           <p className="text-red-400 text-xs bg-red-900/20 rounded p-2">{runError}</p>
         )}
+
+        {/* ICA warning — ICA has no progress signal, can silently take minutes */}
+        {running && pipelineSteps.some(s => s.step === 'ica') && (
+          <p className="text-yellow-300 text-xs bg-yellow-900/20 rounded p-2">
+            ICA is running — this can take 1–5 minutes for long recordings. Please wait.
+          </p>
+        )}
         {runResult && (
           <p className="text-green-400 text-xs bg-green-900/20 rounded p-2">
             ✓ {runResult.n_windows} windows ({runResult.window_shape?.join('×')})
@@ -739,7 +921,7 @@ export default function PreprocessPage() {
         {/* Tab bar + controls */}
         <div className="flex items-center gap-3 mb-3 flex-wrap">
 
-          {/* View mode toggle — Tabs vs Dashboard */}
+          {/* View mode toggle — Tabs | Dashboard | Split */}
           <div className="flex bg-gray-800 rounded-lg p-0.5 gap-0.5">
             <button
               onClick={() => { setViewMode('tabs'); setExpandedChart(null) }}
@@ -759,6 +941,18 @@ export default function PreprocessPage() {
             >
               ⊞ Dashboard
             </button>
+            {/* Split view only available when there is a processed run to compare against */}
+            {hasRun && activeTab !== 'erp' && (
+              <button
+                onClick={() => { setViewMode('split'); setExpandedChart(null); fetchSplitView() }}
+                className={`px-3 py-1 rounded text-xs font-medium transition ${
+                  viewMode === 'split' ? 'bg-green-700 text-white' : 'text-gray-400 hover:text-gray-200'
+                }`}
+                title="Before vs After side by side"
+              >
+                ⇔ Split
+              </button>
+            )}
           </div>
 
           {/* Tab buttons — only shown in tabs mode */}
@@ -780,8 +974,8 @@ export default function PreprocessPage() {
             </div>
           )}
 
-          {/* Before/After toggle — in tabs mode only for non-time tabs; in dashboard always */}
-          {hasRun && (viewMode === 'dashboard' || activeTab !== 'time') && (
+          {/* Before/After toggle — hidden in split mode (it's already implicit in both columns) */}
+          {hasRun && viewMode !== 'split' && (viewMode === 'dashboard' || activeTab !== 'time') && (
             <div className="flex bg-gray-800 rounded-lg p-0.5 gap-0.5">
               <button
                 onClick={() => setShowRaw(true)}
@@ -822,16 +1016,18 @@ export default function PreprocessPage() {
           <button
             onClick={() => {
               if (viewMode === 'dashboard') { fetchAllDashboard(); return }
+              if (viewMode === 'split')     { fetchSplitView(); return }
               if (activeTab === 'frequency')   fetchPsd()
               if (activeTab === 'bandpower')   fetchBandPower()
               if (activeTab === 'spectrogram') fetchSpectrogram()
+              if (activeTab === 'erp')         fetchERP()
               // Time tab: reload waveform AND compute signal quality stats
               if (activeTab === 'time') { loadWaveform(); fetchStats() }
             }}
-            disabled={analysisLoading || statsLoading || Object.values(dashLoading).some(Boolean)}
+            disabled={analysisLoading || statsLoading || splitLoading || Object.values(dashLoading).some(Boolean)}
             className="ml-auto text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 rounded px-3 py-1"
           >
-            {(analysisLoading || statsLoading || Object.values(dashLoading).some(Boolean)) ? 'Loading…' : 'Analyze'}
+            {(analysisLoading || statsLoading || splitLoading || Object.values(dashLoading).some(Boolean)) ? 'Loading…' : 'Analyze'}
           </button>
         </div>
 
@@ -847,11 +1043,37 @@ export default function PreprocessPage() {
           <div className="flex-1 bg-gray-800 rounded-lg p-4 overflow-auto">
             {activeTab === 'time' && (
               <div>
-                <p className="text-xs text-gray-400 mb-2">
-                  Raw signal — {channelNames.length} channels · {currentSession.sample_rate} Hz
-                </p>
+                <div className="flex items-center gap-3 mb-2">
+                  <p className="text-xs text-gray-400">
+                    Raw signal — {channelNames.length} channels · {currentSession.sample_rate} Hz
+                  </p>
+                  {/* Single-channel focus dropdown — lets users zoom into one channel at full height */}
+                  {waveformData?.channel_names?.length > 1 && (
+                    <div className="flex items-center gap-1 ml-auto">
+                      <label className="text-xs text-gray-500">Focus:</label>
+                      <select
+                        value={waveformFocusChannel ?? ''}
+                        onChange={e => setWaveformFocusChannel(e.target.value === '' ? null : parseInt(e.target.value))}
+                        className="bg-gray-700 text-gray-200 text-xs rounded px-2 py-0.5"
+                      >
+                        <option value="">All Channels</option>
+                        {waveformData.channel_names.map((ch, i) => (
+                          <option key={i} value={i}>{ch}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                </div>
                 {waveformData ? (
-                  <WaveformChart data={waveformData.points} channelNames={waveformData.channel_names} />
+                  <WaveformChart
+                    data={waveformData.points}
+                    channelNames={
+                      waveformFocusChannel !== null
+                        ? [waveformData.channel_names[waveformFocusChannel]]
+                        : waveformData.channel_names
+                    }
+                    height={waveformFocusChannel !== null ? 300 : undefined}
+                  />
                 ) : (
                   <p className="text-gray-500 text-sm text-center mt-8">Loading waveform…</p>
                 )}
@@ -954,6 +1176,15 @@ export default function PreprocessPage() {
                 ) : (
                   <SpectrogramChart data={spectrogramData} />
                 )}
+              </div>
+            )}
+            {activeTab === 'erp' && (
+              <div>
+                <p className="text-xs text-gray-400 mb-3">
+                  Event-Related Potential — average signal per class label, time-locked to window onset.
+                  Requires labeled windows (Label page). Each line is one class; noise cancels across trials.
+                </p>
+                <ERPChart data={erpData} loading={erpLoading} error={erpError} />
               </div>
             )}
           </div>
@@ -1062,6 +1293,82 @@ export default function PreprocessPage() {
                 ))}
               </div>
             )}
+          </div>
+        )}
+
+        {/* Chart area — split view mode (Before left, After right for the active tab) */}
+        {viewMode === 'split' && (
+          <div className="flex-1 overflow-auto">
+            <div className="grid grid-cols-2 gap-3 h-full min-h-[300px]">
+              {/* LEFT — Before (raw) */}
+              <div className="bg-gray-800 rounded-lg p-4 flex flex-col">
+                <p className="text-xs font-semibold text-green-400 mb-2 flex-shrink-0">Before (Raw)</p>
+                {splitLoading ? (
+                  <p className="text-gray-500 text-sm text-center mt-8">Loading…</p>
+                ) : (
+                  <>
+                    {activeTab === 'time' && (
+                      waveformData
+                        ? <WaveformChart data={waveformData.points} channelNames={waveformData.channel_names} />
+                        : <p className="text-gray-500 text-sm text-center mt-8">Load waveform first</p>
+                    )}
+                    {activeTab === 'frequency' && (
+                      splitData.raw
+                        ? <FrequencyChart data={splitData.raw} title="Raw — PSD" />
+                        : <p className="text-gray-500 text-sm text-center mt-8">Click ⇔ Split to load</p>
+                    )}
+                    {activeTab === 'bandpower' && (
+                      splitData.raw
+                        ? <BandPowerChart data={splitData.raw} />
+                        : <p className="text-gray-500 text-sm text-center mt-8">Click ⇔ Split to load</p>
+                    )}
+                    {activeTab === 'spectrogram' && (
+                      splitData.raw
+                        ? <SpectrogramChart data={splitData.raw} />
+                        : <p className="text-gray-500 text-sm text-center mt-8">Click ⇔ Split to load</p>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {/* RIGHT — After (processed) */}
+              <div className="bg-gray-800 rounded-lg p-4 flex flex-col">
+                <p className="text-xs font-semibold text-blue-400 mb-2 flex-shrink-0">
+                  After (Preprocessed{activeRunId ? ` — ${runs.find(r => r.run_id === activeRunId)?.name || activeRunId.slice(0, 8)}` : ''})
+                </p>
+                {splitLoading ? (
+                  <p className="text-gray-500 text-sm text-center mt-8">Loading…</p>
+                ) : !activeRunId ? (
+                  <p className="text-yellow-400 text-xs text-center mt-8">
+                    No pipeline run selected — run a pipeline first.
+                  </p>
+                ) : (
+                  <>
+                    {activeTab === 'time' && (
+                      <p className="text-gray-500 text-xs text-center mt-8">
+                        Processed waveform preview not available.<br />
+                        Switch to Frequency or Band Power tab for Before/After comparison.
+                      </p>
+                    )}
+                    {activeTab === 'frequency' && (
+                      splitData.processed
+                        ? <FrequencyChart data={splitData.processed} title="Preprocessed — PSD" />
+                        : <p className="text-gray-500 text-sm text-center mt-8">No data</p>
+                    )}
+                    {activeTab === 'bandpower' && (
+                      splitData.processed
+                        ? <BandPowerChart data={splitData.processed} />
+                        : <p className="text-gray-500 text-sm text-center mt-8">No data</p>
+                    )}
+                    {activeTab === 'spectrogram' && (
+                      splitData.processed
+                        ? <SpectrogramChart data={splitData.processed} />
+                        : <p className="text-gray-500 text-sm text-center mt-8">No data</p>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
           </div>
         )}
 

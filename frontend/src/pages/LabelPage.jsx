@@ -9,7 +9,7 @@
 //           After labeling windows, user hits "Save Labels" to persist to backend
 //
 // All API calls use async/await as required by CLAUDE.md.
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useSession } from '../hooks/useSession'
 import WaveformChart from '../components/WaveformChart'
 
@@ -395,6 +395,61 @@ export default function LabelPage() {
   const progressPct   = totalWindows > 0 ? Math.round((labeledCount / totalWindows) * 100) : 0
 
   // -------------------------------------------------------------------------
+  // Class color map — stable color per class name for timeline strip
+  // -------------------------------------------------------------------------
+  const CLASS_PALETTE = ['#a78bfa','#34d399','#fb923c','#60a5fa','#f472b6','#facc15','#4ade80','#f87171']
+  const classColorMap = useMemo(() => {
+    const classes = [...new Set(Object.values(labels))]
+    const map = {}
+    classes.forEach((cls, i) => { map[cls] = CLASS_PALETTE[i % CLASS_PALETTE.length] })
+    return map
+  }, [JSON.stringify(Object.values(labels).sort())])
+
+  // -------------------------------------------------------------------------
+  // Keyboard shortcuts
+  // -------------------------------------------------------------------------
+  const timelineRef = useRef(null)
+
+  useEffect(() => {
+    if (!activeRun) return
+
+    function handleKeyDown(e) {
+      // Ignore when typing in an input/textarea
+      const tag = e.target.tagName.toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault()
+        setWindowIndex(i => Math.max(0, i - 1))
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault()
+        setWindowIndex(i => Math.min(totalWindows - 1, i + 1))
+      } else if (e.key === '1') {
+        assignLabel(PRESET_LABELS[0])
+      } else if (e.key === '2') {
+        assignLabel(PRESET_LABELS[1])
+      } else if (e.key === '3') {
+        assignLabel(PRESET_LABELS[2])
+      } else if (e.key === '4') {
+        assignLabel(PRESET_LABELS[3])
+      } else if (e.key === 'Backspace') {
+        e.preventDefault()
+        setLabels(prev => { const n = { ...prev }; delete n[windowIndex]; return n })
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [activeRun, windowIndex, totalWindows])
+
+  // Auto-scroll the current timeline square into view
+  useEffect(() => {
+    if (!timelineRef.current) return
+    const el = timelineRef.current.querySelector(`[data-idx="${windowIndex}"]`)
+    if (el) el.scrollIntoView({ inline: 'nearest', block: 'nearest', behavior: 'smooth' })
+  }, [windowIndex])
+
+  // -------------------------------------------------------------------------
   // Guard: no session loaded
   // -------------------------------------------------------------------------
 
@@ -545,6 +600,55 @@ export default function LabelPage() {
       </div>
 
       {/* ---------------------------------------------------------------- */}
+      {/* Timeline strip — one square per window, click to navigate        */}
+      {/* ---------------------------------------------------------------- */}
+      {totalWindows > 0 && (
+        <div className="mb-4">
+          <div
+            ref={timelineRef}
+            className="overflow-x-auto"
+            style={{ scrollbarWidth: 'thin' }}
+          >
+            <div className="flex gap-px pb-1" style={{ width: 'max-content' }}>
+              {Array.from({ length: totalWindows }, (_, i) => {
+                const label = labels[i]
+                const isActive = i === windowIndex
+                return (
+                  <button
+                    key={i}
+                    data-idx={i}
+                    onClick={() => setWindowIndex(i)}
+                    title={label ? `${i + 1}: ${label}` : `Window ${i + 1} (unlabeled)`}
+                    style={{
+                      width: 8,
+                      height: 16,
+                      background: label ? classColorMap[label] : '#374151',
+                      outline: isActive ? '2px solid white' : 'none',
+                      outlineOffset: '1px',
+                      flexShrink: 0,
+                    }}
+                  />
+                )
+              })}
+            </div>
+          </div>
+          {/* Legend */}
+          <div className="flex flex-wrap gap-3 mt-1">
+            {Object.entries(classColorMap).map(([cls, color]) => (
+              <span key={cls} className="flex items-center gap-1 text-xs text-gray-400">
+                <span style={{ width: 8, height: 8, background: color, display: 'inline-block', borderRadius: 2 }} />
+                {cls}
+              </span>
+            ))}
+            <span className="flex items-center gap-1 text-xs text-gray-600">
+              <span style={{ width: 8, height: 8, background: '#374151', display: 'inline-block', borderRadius: 2 }} />
+              unlabeled
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------- */}
       {/* Window navigation                                                 */}
       {/* ---------------------------------------------------------------- */}
       <div className="flex items-center justify-between mb-3">
@@ -691,6 +795,10 @@ export default function LabelPage() {
       {/* Label assignment buttons                                          */}
       {/* ---------------------------------------------------------------- */}
       <div className="mb-6">
+        {/* Keyboard shortcuts hint */}
+        <p className="text-xs text-gray-600 bg-gray-900 rounded px-3 py-1.5 mb-3 font-mono">
+          ← → navigate &nbsp;·&nbsp; 1=Rest &nbsp;2=Left &nbsp;3=Right &nbsp;4=Blink &nbsp;·&nbsp; Backspace=clear
+        </p>
         <p className="text-xs text-gray-500 uppercase tracking-wider mb-3">
           Assign label to window {windowIndex + 1}
         </p>

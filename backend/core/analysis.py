@@ -349,3 +349,87 @@ def compute_signal_stats(
 
     logger.debug("Signal stats computed: %d channels", n_channels)
     return {"channels": results}
+
+
+def compute_erp(
+    labeled_windows: list,
+    sample_rate: int,
+    channel_names: list[str] | None = None,
+) -> dict:
+    """
+    Compute Event-Related Potentials (ERPs) by averaging labeled EEG windows per class.
+
+    An ERP is the average brain response time-locked to a stimulus or event.
+    By averaging many trials of the same class together, random noise cancels out
+    while consistent event-related activity accumulates — revealing components like
+    P300 (positive deflection at ~300ms) and N200 (negative deflection at ~200ms).
+
+    This is the most fundamental analysis in ERP research (Luck, 2014) and is
+    widely used for P300 spellers, SSVEP BCIs, and motor-imagery systems.
+
+    Args:
+        labeled_windows: list[LabeledWindow] — windows with .data (n_channels, n_samples)
+                         and .label (str). Windows labeled 'unknown' are excluded.
+        sample_rate:     Sampling rate in Hz. Used to build the time axis.
+        channel_names:   Channel names for the first window. Inferred if None.
+
+    Returns:
+        {
+          "classes":    ["left", "right", "rest"],
+          "time_ms":    [0.0, 3.9, 7.8, ...],          # time axis in milliseconds
+          "channels":   ["Fp1", "Fp2", ...],
+          "averages":   {
+            "left":  {"Fp1": [µV, ...], "Fp2": [...], ...},
+            "right": {...},
+            ...
+          },
+          "n_windows":  {"left": 45, "right": 42, "rest": 50}
+        }
+    """
+    # Filter out unlabeled windows
+    valid = [lw for lw in labeled_windows if lw.label and lw.label != "unknown"]
+    if not valid:
+        return {"classes": [], "time_ms": [], "channels": [], "averages": {}, "n_windows": {}}
+
+    # Infer channel names from the first window if not provided
+    first_data = valid[0].data  # shape (n_channels, n_samples)
+    n_channels, n_samples = first_data.shape
+    if channel_names is None or len(channel_names) != n_channels:
+        channel_names = [f"ch_{i}" for i in range(n_channels)]
+
+    # Build time axis in milliseconds (0 ms = start of window)
+    time_ms = [round(i / sample_rate * 1000, 2) for i in range(n_samples)]
+
+    # Group windows by label
+    from collections import defaultdict
+    groups: dict[str, list[np.ndarray]] = defaultdict(list)
+    for lw in valid:
+        if lw.data.shape == (n_channels, n_samples):
+            groups[lw.label].append(lw.data.astype(np.float64))
+
+    class_names = sorted(groups.keys())
+    averages: dict[str, dict[str, list[float]]] = {}
+    n_windows: dict[str, int] = {}
+
+    for label, windows in groups.items():
+        # Stack into (n_trials, n_channels, n_samples) and mean over trials
+        stack = np.stack(windows, axis=0)               # (N, n_channels, n_samples)
+        mean  = np.mean(stack, axis=0)                  # (n_channels, n_samples)
+        averages[label] = {
+            channel_names[i]: mean[i].tolist()
+            for i in range(n_channels)
+        }
+        n_windows[label] = len(windows)
+
+    logger.debug(
+        "ERP computed: %d classes, %d channels, %d samples each",
+        len(class_names), n_channels, n_samples,
+    )
+
+    return {
+        "classes":   class_names,
+        "time_ms":   time_ms,
+        "channels":  channel_names,
+        "averages":  averages,
+        "n_windows": n_windows,
+    }

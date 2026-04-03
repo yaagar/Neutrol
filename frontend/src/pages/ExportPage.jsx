@@ -260,6 +260,14 @@ function ModelCard({
             },
           ]}
           downloading={downloading}
+          usageExample={`# Keep inference_script.py and model.pt in the same folder
+from inference_script import predict
+import numpy as np
+
+# window: numpy array of shape (n_channels, n_samples)
+window = np.random.randn(${job.n_channels ?? 8}, ${job.n_samples ?? 256})
+result = predict(window)
+print(result['predicted_class'], result['confidence'])`}
         />
 
         {/* Card 2 — ONNX */}
@@ -285,6 +293,18 @@ function ModelCard({
             },
           ]}
           downloading={downloading}
+          usageExample={`import onnxruntime as ort
+import numpy as np
+
+sess = ort.InferenceSession("model.onnx")
+input_name = sess.get_inputs()[0].name
+
+# window: (n_channels, n_samples) float32 numpy array
+window = np.random.randn(1, 1, ${job.n_channels ?? 8}, ${job.n_samples ?? 256}).astype(np.float32)
+outputs = sess.run(None, {input_name: window})
+logits = outputs[0][0]
+predicted = int(np.argmax(logits))
+print("Class:", ${JSON.stringify(job.classes ?? ['0','1'])}[predicted])`}
         />
 
         {/* Card 3 — Microcontroller */}
@@ -303,6 +323,13 @@ function ModelCard({
             },
           ]}
           downloading={downloading}
+          usageExample={`// The ZIP contains:
+//   model_data.h        — TFLite flatbuffer as a C array
+//   neutrol_inference.cpp — Arduino sketch with predict() function
+//   README.txt          — Wiring and usage instructions
+//
+// Open neutrol_inference.cpp in Arduino IDE, flash to ESP32 or Arduino Nano 33 BLE.
+// Connect via Serial at 9600 baud and send a window as raw bytes.`}
         />
 
         {/* Card 4 — Pipeline JSON (links to pipeline runs section) */}
@@ -336,7 +363,9 @@ function ModelCard({
 // ExportFormatCard — one format tile inside a ModelCard
 // ---------------------------------------------------------------------------
 
-function ExportFormatCard({ title, badge, description, badgeColor, buttons, downloading, footer }) {
+function ExportFormatCard({ title, badge, description, badgeColor, buttons, downloading, footer, usageExample }) {
+  const [showExample, setShowExample] = useState(false)
+
   const badgeColors = {
     purple: 'bg-purple-900/40 border-purple-700 text-purple-300',
     blue:   'bg-blue-900/40   border-blue-700   text-blue-300',
@@ -371,6 +400,23 @@ function ExportFormatCard({ title, badge, description, badgeColor, buttons, down
               color={btn.color}
             />
           ))}
+        </div>
+      )}
+
+      {/* Usage example — collapsible code snippet */}
+      {usageExample && (
+        <div>
+          <button
+            onClick={() => setShowExample(v => !v)}
+            className="text-xs text-gray-600 hover:text-gray-400 transition-colors"
+          >
+            {showExample ? '▾ Hide' : '▸ Show'} usage example
+          </button>
+          {showExample && (
+            <pre className="mt-2 bg-gray-900 border border-gray-800 rounded p-3 text-xs text-green-400 font-mono overflow-x-auto whitespace-pre-wrap">
+              {usageExample}
+            </pre>
+          )}
         </div>
       )}
 

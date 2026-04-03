@@ -18,16 +18,22 @@ const API = API_BASE_URL
 
 // Color per layer type for the left border of each card
 const LAYER_COLORS = {
-  Conv2d:          'border-blue-500',
-  DepthwiseConv2d: 'border-cyan-500',
-  AvgPool2d:       'border-green-500',
-  MaxPool2d:       'border-emerald-500',
-  Dropout:         'border-yellow-500',
-  BatchNorm2d:     'border-orange-500',
-  Flatten:         'border-gray-400',
-  Linear:          'border-purple-500',
-  LSTM:            'border-pink-500',
-  CustomLayer:     'border-amber-500',
+  Conv2d:           'border-blue-500',
+  DepthwiseConv2d:  'border-cyan-500',
+  AvgPool2d:        'border-green-500',
+  MaxPool2d:        'border-emerald-500',
+  Dropout:          'border-yellow-500',
+  BatchNorm2d:      'border-orange-500',
+  BatchNorm1d:      'border-orange-400',
+  Flatten:          'border-gray-400',
+  Linear:           'border-purple-500',
+  Dense:            'border-violet-500',
+  LSTM:             'border-pink-500',
+  GRU:              'border-rose-500',
+  SimpleRNN:        'border-red-400',
+  TemporalAttention: 'border-indigo-400',
+  BahdanauAttention: 'border-indigo-500',
+  CustomLayer:      'border-amber-500',
 }
 
 // Default parameters to fill in when adding a new layer of a given type

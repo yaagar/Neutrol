@@ -76,6 +76,87 @@ class EEGDataset(Dataset):
 # compute_confusion_matrix — pure numpy, no sklearn required
 # ---------------------------------------------------------------------------
 
+def compute_roc_per_class(
+    y_true: list[int],
+    y_proba: list[list[float]],
+    n_classes: int,
+) -> list[dict]:
+    """
+    Compute one-vs-rest ROC curves and AUC for each class.
+
+    For each class c:
+      - Binary label: 1 if y_true == c, else 0
+      - Score: y_proba[i][c] (probability assigned to class c by the model)
+      - ROC points: (FPR, TPR) pairs traced by varying the decision threshold
+      - AUC: area under the ROC curve via the trapezoidal rule
+
+    Returns a list of dicts:
+      [{"class_idx": int, "auc": float, "points": [{"fpr": float, "tpr": float}, ...]}]
+
+    Points are downsampled to at most MAX_ROC_POINTS for efficient JSON transfer.
+    AUC of 0.5 = no skill (random); AUC of 1.0 = perfect classifier.
+
+    Pure NumPy implementation — no sklearn dependency.
+    """
+    MAX_ROC_POINTS = 200
+    results = []
+
+    for c in range(n_classes):
+        y_binary = [1 if t == c else 0 for t in y_true]
+        scores   = [p[c] if p and c < len(p) else 0.0 for p in y_proba]
+
+        n_pos = sum(y_binary)
+        n_neg = len(y_binary) - n_pos
+
+        if n_pos == 0 or n_neg == 0:
+            # Degenerate case — only one class in validation set
+            results.append({
+                "class_idx": c,
+                "auc":       0.5,
+                "points":    [{"fpr": 0.0, "tpr": 0.0}, {"fpr": 1.0, "tpr": 1.0}],
+            })
+            continue
+
+        # Sort by descending score (higher score = model thinks it's class c)
+        pairs = sorted(zip(scores, y_binary), key=lambda x: -x[0])
+
+        tp = fp = 0
+        points = [{"fpr": 0.0, "tpr": 0.0}]
+        for _, label in pairs:
+            if label == 1:
+                tp += 1
+            else:
+                fp += 1
+            points.append({
+                "fpr": round(fp / n_neg, 5),
+                "tpr": round(tp / n_pos, 5),
+            })
+        points.append({"fpr": 1.0, "tpr": 1.0})
+
+        # AUC via trapezoidal rule
+        auc = sum(
+            (points[i + 1]["fpr"] - points[i]["fpr"])
+            * (points[i + 1]["tpr"] + points[i]["tpr"]) / 2
+            for i in range(len(points) - 1)
+        )
+
+        # Downsample points to avoid large JSON payloads
+        if len(points) > MAX_ROC_POINTS:
+            step   = len(points) // MAX_ROC_POINTS
+            points = points[::step]
+            # Always include the (1, 1) end point
+            if points[-1] != {"fpr": 1.0, "tpr": 1.0}:
+                points.append({"fpr": 1.0, "tpr": 1.0})
+
+        results.append({
+            "class_idx": c,
+            "auc":       round(auc, 4),
+            "points":    points,
+        })
+
+    return results
+
+
 def compute_confusion_matrix(y_true: list[int], y_pred: list[int], n_classes: int) -> list[list[int]]:
     """
     Build an n_classes × n_classes confusion matrix without sklearn.
@@ -374,18 +455,49 @@ def run_training(
                 job_id, finetune_from_job_id, classes,
             )
 
-        # Adam is the standard choice for EEG models — handles sparse gradients
-        # and adapts learning rate per-parameter.
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=model_config.get("learning_rate", 0.001),
-        )
+        # Build optimizer from model_config["optimizer"] (default: adam).
+        # Adam is still the best default for EEG but researchers may want:
+        #   sgd  — standard gradient descent; needs careful learning rate tuning
+        #   rmsprop — good for RNNs/LSTMs (handles non-stationary gradients)
+        #   adamw — Adam with decoupled weight decay; better regularisation
+        lr            = float(model_config.get("learning_rate", 0.001))
+        weight_decay  = float(model_config.get("weight_decay", 0.0))
+        optimizer_name = str(model_config.get("optimizer", "adam")).lower()
+
+        if optimizer_name == "sgd":
+            optimizer = torch.optim.SGD(
+                model.parameters(), lr=lr, weight_decay=weight_decay, momentum=0.9,
+            )
+        elif optimizer_name == "rmsprop":
+            optimizer = torch.optim.RMSprop(
+                model.parameters(), lr=lr, weight_decay=weight_decay,
+            )
+        elif optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=lr, weight_decay=weight_decay,
+            )
+        else:
+            # Default: Adam
+            optimizer = torch.optim.Adam(
+                model.parameters(), lr=lr, weight_decay=weight_decay,
+            )
 
         # CrossEntropyLoss combines log-softmax + negative log-likelihood.
         # It expects raw logits from the model (no softmax in forward()).
         criterion = nn.CrossEntropyLoss()
 
         epochs = model_config.get("epochs", 50)
+
+        # Early stopping: stop training when validation loss stops improving.
+        # patience=0 means disabled (train all epochs regardless).
+        early_stopping_patience = int(model_config.get("early_stopping_patience", 0))
+        best_val_loss    = float("inf")
+        patience_counter = 0
+
+        # Gradient clipping: clips gradient norm before optimizer step.
+        # Prevents exploding gradients in RNNs/LSTMs on EEG data.
+        # 0.0 means disabled.
+        gradient_clip_norm = float(model_config.get("gradient_clip_norm", 0.0))
 
         # Update the job with the config it's running with
         store.training_jobs[job_id]["n_classes"] = n_classes
@@ -410,6 +522,10 @@ def run_training(
                 logits = model(X_batch)         # forward pass
                 loss   = criterion(logits, y_batch)  # compute loss
                 loss.backward()                 # backpropagation
+                # Gradient clipping: prevents NaN/exploding gradients in RNNs.
+                # Clips the L2 norm of all gradients to gradient_clip_norm.
+                if gradient_clip_norm > 0.0:
+                    nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
                 optimizer.step()                # update weights
 
                 train_loss_sum += loss.item() * len(y_batch)
@@ -467,21 +583,47 @@ def run_training(
                 job_id, epoch + 1, epochs, train_loss, val_loss, train_acc, val_acc,
             )
 
+            # ---- Early stopping check ----
+            # Monitor validation loss. If it has not improved for 'patience' epochs,
+            # stop training early to prevent overfitting.
+            if early_stopping_patience > 0:
+                if val_loss < best_val_loss:
+                    best_val_loss    = val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= early_stopping_patience:
+                        logger.info(
+                            "Job %s early stopping at epoch %d (patience=%d, "
+                            "best_val_loss=%.4f)",
+                            job_id, epoch + 1, early_stopping_patience, best_val_loss,
+                        )
+                        push({
+                            "type":    "info",
+                            "message": f"Early stopping at epoch {epoch + 1} "
+                                       f"(no improvement for {early_stopping_patience} epochs).",
+                        })
+                        break  # exit training loop
+
         # ------------------------------------------------------------------
-        # 6. Final evaluation — confusion matrix on validation set
+        # 6. Final evaluation — confusion matrix + ROC curves on validation set
         # ------------------------------------------------------------------
         model.eval()
-        all_true = []
-        all_pred = []
+        all_true  = []
+        all_pred  = []
+        all_proba = []  # list of per-sample softmax probability vectors
 
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 logits = model(X_batch.to(device))
                 preds  = logits.argmax(dim=1).cpu().numpy()
+                proba  = torch.softmax(logits, dim=1).cpu().numpy()
                 all_pred.extend(preds.tolist())
                 all_true.extend(y_batch.numpy().tolist())
+                all_proba.extend(proba.tolist())
 
         confusion = compute_confusion_matrix(all_true, all_pred, n_classes)
+        roc_data  = compute_roc_per_class(all_true, all_proba, n_classes)
 
         # ------------------------------------------------------------------
         # 7. Save model weights to exports/
@@ -533,6 +675,7 @@ def run_training(
             "final_train_acc":  final_train_acc,
             "final_val_acc":    final_val_acc,
             "confusion_matrix": confusion,
+            "roc_data":         roc_data,
             "class_names":      classes,
             "model_path":       model_path,
             "finetuned_from":   finetune_from_job_id,

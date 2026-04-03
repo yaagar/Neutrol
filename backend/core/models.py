@@ -126,6 +126,52 @@ LAYER_TYPES_SCHEMA: list[dict] = [
         ],
     },
     {
+        "type": "GRU",
+        "description": "Gated Recurrent Unit — faster than LSTM, better on small datasets. Place after Flatten",
+        "supports_activation": False,
+        "parameters": [
+            {"name": "hidden_size", "type": "int",   "default": 64,  "description": "Features in the hidden state"},
+            {"name": "num_layers",  "type": "int",   "default": 1,   "description": "Stacked GRU layers"},
+            {"name": "dropout",     "type": "float", "default": 0.0, "description": "Dropout between layers (only if num_layers > 1)"},
+        ],
+    },
+    {
+        "type": "TemporalAttention",
+        "description": "Learned attention over the time axis — keeps only the most informative time points. Place after Conv layers, before Linear",
+        "supports_activation": False,
+        "parameters": [],
+    },
+    {
+        "type": "SimpleRNN",
+        "description": "Basic Recurrent Neural Network. Faster than LSTM/GRU but may struggle with long sequences. Place after Flatten",
+        "supports_activation": False,
+        "parameters": [
+            {"name": "hidden_size", "type": "int",   "default": 64, "description": "Features in the hidden state"},
+            {"name": "num_layers",  "type": "int",   "default": 1,  "description": "Stacked RNN layers"},
+        ],
+    },
+    {
+        "type": "BahdanauAttention",
+        "description": "Additive (Bahdanau) attention — learns a weighted sum over the time axis using query/key projections. Place after LSTM/GRU",
+        "supports_activation": False,
+        "parameters": [],
+    },
+    {
+        "type": "Dense",
+        "description": "Fully connected layer with optional activation — shorthand for Linear+activation in one card. Good for MLP architectures",
+        "supports_activation": True,
+        "parameters": [
+            {"name": "out_features", "type": "int_or_string", "default": 64,
+             "description": "Number of output units. Use 'n_classes' for the final classification layer"},
+        ],
+    },
+    {
+        "type": "BatchNorm1d",
+        "description": "1D batch normalization — for use after RNN/LSTM/GRU or Flatten layers (use BatchNorm2d after Conv layers)",
+        "supports_activation": False,
+        "parameters": [],
+    },
+    {
         "type": "CustomLayer",
         "description": "User-defined PyTorch layer — paste your nn.Module class code",
         "supports_activation": False,
@@ -235,6 +281,173 @@ class _LSTMWrapper(nn.Module):
         return out[:, -1, :]  # take last timestep: (batch, hidden_size)
 
 
+class _GRUWrapper(nn.Module):
+    """
+    GRU (Gated Recurrent Unit) that accepts flat 1D input from Flatten.
+
+    GRU vs LSTM: GRU has fewer parameters (2 gates instead of 3) — trains
+    faster and generalises better on smaller EEG datasets. The forget-gate
+    mechanism is merged with the update gate. For datasets under ~1000 windows
+    per class, GRU often outperforms LSTM.
+
+    Input:  (batch, features) from Flatten
+    Output: (batch, hidden_size) — last timestep only
+    """
+
+    def __init__(self, hidden_size: int, num_layers: int = 1, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers  = num_layers
+        self._dropout    = dropout
+        self._gru: nn.GRU | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # (batch, features) → (batch, 1, features)
+        if self._gru is None:
+            gru_drop = self._dropout if self.num_layers > 1 else 0.0
+            self._gru = nn.GRU(
+                x.shape[2], self.hidden_size,
+                num_layers=self.num_layers,
+                batch_first=True,
+                dropout=gru_drop,
+            ).to(x.device)
+        out, _ = self._gru(x)
+        return out[:, -1, :]  # take last timestep: (batch, hidden_size)
+
+
+class _SimpleRNNWrapper(nn.Module):
+    """
+    Simple RNN that accepts flat 1D input from a preceding Flatten layer.
+
+    Input:  (batch, features) from Flatten
+    Output: (batch, hidden_size) — last timestep only
+
+    SimpleRNN is computationally cheaper than LSTM/GRU but may struggle
+    with long sequences (vanishing gradient problem). Useful as a quick
+    baseline or when sequence lengths are short (< 50 time steps).
+    """
+
+    def __init__(self, hidden_size: int, num_layers: int = 1) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers  = num_layers
+        self._rnn: nn.RNN | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # (batch, features) → (batch, 1, features)
+        if self._rnn is None:
+            self._rnn = nn.RNN(
+                x.shape[2], self.hidden_size,
+                num_layers=self.num_layers,
+                batch_first=True,
+                nonlinearity='tanh',
+            ).to(x.device)
+        out, _ = self._rnn(x)
+        return out[:, -1, :]  # take last timestep: (batch, hidden_size)
+
+
+class _BahdanauAttention(nn.Module):
+    """
+    Additive (Bahdanau) attention over the time axis.
+
+    Computes a learned weighted sum over the time dimension of an RNN output.
+    Unlike TemporalAttentionPooling (which operates on conv feature maps),
+    this expects input in (batch, time, features) format — naturally matching
+    LSTM/GRU output (with batch_first=True before last-step extraction).
+
+    Input:  (batch, features) from LSTM/GRU last-step output OR
+            (batch, time, features) from a sequence-keeping LSTM/GRU
+    Output: (batch, features) — context vector
+
+    Mechanism: score_t = v · tanh(W · h_t), weights = softmax(scores),
+               context = sum(weights_t * h_t)
+
+    Inspired by: Bahdanau et al. (2015), "Neural Machine Translation by
+    Jointly Learning to Align and Translate"
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._W: nn.Linear | None = None  # lazily built on first forward
+        self._v: nn.Linear | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Accept 2D input (batch, features) from last-step LSTM wrappers
+        # by treating it as a single time step
+        if x.dim() == 2:
+            return x  # nothing to attend over — pass through
+
+        # x: (batch, time, features)
+        batch, time, features = x.shape
+
+        if self._W is None:
+            self._W = nn.Linear(features, features, bias=True).to(x.device)
+            self._v = nn.Linear(features, 1, bias=False).to(x.device)
+
+        # Additive attention: score_t = v · tanh(W · h_t)
+        energy  = torch.tanh(self._W(x))           # (batch, time, features)
+        scores  = self._v(energy).squeeze(-1)       # (batch, time)
+        weights = torch.softmax(scores, dim=1)      # (batch, time) — normalized
+        # Weighted sum: (batch, time) unsqueeze × (batch, time, features) → (batch, features)
+        context = (weights.unsqueeze(-1) * x).sum(dim=1)  # (batch, features)
+        return context
+
+
+class _TemporalAttentionPooling(nn.Module):
+    """
+    Learned temporal attention pooling — replaces AvgPool over the time axis.
+
+    Instead of equally averaging all time points, this layer learns *which*
+    time points matter most for classification. Useful for EEG where informative
+    activity (alpha burst, P300 peak) occupies only a short window in the epoch.
+
+    Inspired by Bahdanau-style additive attention (Bahdanau et al., 2015)
+    adapted for use in sequential CNN models.
+
+    Input:  (batch, channels, time) — 3D tensor, e.g. after Conv2d + squeeze
+            OR (batch, features) — 2D tensor (treated as single time-step; passthrough)
+    Output: (batch, channels) — attention-weighted sum over the time axis
+
+    Placement: put this layer after the final conv layer and before Flatten/Linear.
+    It replaces AvgPool2d when temporal selectivity is desired.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._attention: nn.Linear | None = None  # lazily built on first forward pass
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            # Already 2D — no time axis to attend over, pass through unchanged
+            return x
+
+        # 4D input (batch, feat_maps, height, time) from Conv layers:
+        # Flatten feat_maps × height into a single feature dimension,
+        # keeping the time axis as the sequence dimension to attend over.
+        if x.dim() == 4:
+            batch, feat, h, time = x.shape
+            # Reshape to (batch, feat*h, time) — all spatial features per time step
+            x = x.view(batch, feat * h, time)
+
+        # x is now (batch, features, time)
+        batch, features, time = x.shape
+
+        # Build the attention scorer lazily on first forward pass.
+        # Maps each time step's feature vector (length=features) to a scalar score.
+        if self._attention is None:
+            self._attention = nn.Linear(features, 1, bias=True).to(x.device)
+
+        # Transpose to (batch, time, features) for the linear layer
+        x_t = x.permute(0, 2, 1)                # (batch, time, features)
+        scores = self._attention(x_t)            # (batch, time, 1)
+        weights = torch.softmax(scores, dim=1)   # (batch, time, 1) — softmax over time
+        # Weighted sum over time: (batch, features, time) × (batch, time, 1) → (batch, features)
+        context = torch.bmm(x, weights)          # (batch, features, 1)
+        return context.squeeze(2)                # (batch, features)
+
+
 # ---------------------------------------------------------------------------
 # _build_layer_modules
 # ---------------------------------------------------------------------------
@@ -295,6 +508,37 @@ def _build_layer_modules(layer_cfg: dict, n_channels: int, n_classes: int) -> li
             num_layers=int(layer_cfg.get("num_layers", 1)),
             dropout=float(layer_cfg.get("dropout", 0.0)),
         ))
+
+    elif t == "GRU":
+        modules.append(_GRUWrapper(
+            hidden_size=int(layer_cfg.get("hidden_size", 64)),
+            num_layers=int(layer_cfg.get("num_layers", 1)),
+            dropout=float(layer_cfg.get("dropout", 0.0)),
+        ))
+
+    elif t == "TemporalAttention":
+        modules.append(_TemporalAttentionPooling())
+
+    elif t == "SimpleRNN":
+        modules.append(_SimpleRNNWrapper(
+            hidden_size=int(layer_cfg.get("hidden_size", 64)),
+            num_layers=int(layer_cfg.get("num_layers", 1)),
+        ))
+
+    elif t == "BahdanauAttention":
+        modules.append(_BahdanauAttention())
+
+    elif t == "Dense":
+        # Dense = Linear + optional activation in one card (shorthand for MLP-style architectures)
+        out_feat = layer_cfg["out_features"]
+        if out_feat == "n_classes":
+            out_feat = n_classes
+        modules.append(nn.LazyLinear(int(out_feat)))
+        if "activation" in layer_cfg:
+            modules.append(get_activation(layer_cfg["activation"]))
+
+    elif t == "BatchNorm1d":
+        modules.append(nn.LazyBatchNorm1d())
 
     elif t == "CustomLayer":
         # Execute the user's class definition in a sandboxed namespace.
@@ -372,14 +616,14 @@ def validate_model_config(config: dict) -> list[str]:
         return errors
 
     last = layers[-1]
-    if last.get("type") != "Linear":
+    if last.get("type") not in ("Linear", "Dense"):
         errors.append(
-            f"The last layer must be Linear (produces class scores). "
+            f"The last layer must be Linear or Dense (produces class scores). "
             f"Currently it is '{last.get('type')}'."
         )
     elif str(last.get("out_features")) != "n_classes":
         errors.append(
-            "The last Linear layer must have out_features='n_classes'. "
+            "The last Linear/Dense layer must have out_features='n_classes'. "
             f"Currently: '{last.get('out_features')}'."
         )
 

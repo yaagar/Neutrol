@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from core.analysis import (
     compute_band_power,
+    compute_erp,
     compute_fft,
     compute_psd,
     compute_signal_stats,
@@ -103,6 +104,12 @@ class PSDRequest(BaseModel):
     session_id: str
     run_id:     str | None = None
     nperseg:    int = 256      # Welch segment length in samples
+
+
+class ERPRequest(BaseModel):
+    """Body for POST /api/analysis/erp — needs a run_id to find labeled windows."""
+    session_id: str
+    run_id:     str
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +254,66 @@ async def spectrogram_endpoint(request: SpectrogramRequest) -> JSONResponse:
         return JSONResponse(
             status_code=500,
             content=api_response(False, error=f"Spectrogram computation failed: {exc}"),
+        )
+
+    return JSONResponse(status_code=200, content=api_response(True, data=data))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analysis/erp
+# ---------------------------------------------------------------------------
+
+@router.post("/erp")
+async def erp_endpoint(request: ERPRequest) -> JSONResponse:
+    """
+    Compute Event-Related Potentials by averaging labeled windows per class.
+
+    Returns per-class, per-channel average waveforms and a millisecond time axis.
+    The frontend draws overlaid lines for each class label so users can visually
+    compare ERP components (P300, N200, alpha ERD) across conditions.
+
+    Requires that the pipeline run has associated labeled windows in the store
+    (i.e. the Label page has been used after running the pipeline).
+    """
+    session = store.sessions.get(request.session_id)
+    if session is None:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(False, error=f"Session '{request.session_id}' not found."),
+        )
+
+    labeled_windows = store.labeled_data.get(request.run_id, [])
+    if not labeled_windows:
+        return JSONResponse(
+            status_code=404,
+            content=api_response(
+                False,
+                error=(
+                    f"No labeled windows found for run '{request.run_id}'. "
+                    "Go to the Label page and label some windows first."
+                ),
+            ),
+        )
+
+    try:
+        # Use channel names that match the run's windows (post-ChannelSelector)
+        run = store.pipeline_runs.get(request.run_id)
+        if run and isinstance(run, dict) and run.get("windows"):
+            n_channels = run["windows"][0].shape[0]
+            ch_names = (
+                session.channel_names[:n_channels]
+                if len(session.channel_names) >= n_channels
+                else [f"ch_{i}" for i in range(n_channels)]
+            )
+        else:
+            ch_names = session.channel_names
+
+        data = compute_erp(labeled_windows, session.sample_rate, ch_names)
+    except Exception as exc:
+        logger.error("ERP failed for run %s: %s", request.run_id, exc)
+        return JSONResponse(
+            status_code=500,
+            content=api_response(False, error=f"ERP computation failed: {exc}"),
         )
 
     return JSONResponse(status_code=200, content=api_response(True, data=data))
